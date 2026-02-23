@@ -87,7 +87,7 @@ sequenceDiagram
 
   C->>S: POST /create
   S->>H: Create tap + assign IP
-  S->>H: Add NAT rule (iptables MASQUERADE)
+  S->>H: Ensure NAT (global MASQUERADE rule)
   S->>H: Clone rootfs
   S->>H: Write Firecracker config JSON
   S->>F: Start Firecracker process
@@ -198,7 +198,7 @@ Per sandbox:
 - veth pair connecting the sandbox netns to the root namespace (routing boundary)
 - private `/30` subnet (`172.16.X.0/30` pattern)
 - host IP (`.1`) and guest IP (`.2`)
-- NAT rule via iptables `MASQUERADE` on host egress interface
+- NAT rule via iptables `MASQUERADE` on host egress interface (installed once, shared)
 
 What this means:
 

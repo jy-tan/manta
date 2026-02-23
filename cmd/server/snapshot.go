@@ -56,7 +56,7 @@ func ensureSnapshot(cfg config) (snapshotPaths, error) {
 	// can be restored inside per-sandbox netns+jail directories.
 	const snapID = "snapshot"
 	const snapSubnet = 250
-	nc, err := setupSandboxNetnsAndRouting(snapID, snapSubnet, cfg.HostNATIface)
+	nc, err := setupSandboxNetnsAndRouting(snapID, snapSubnet)
 	if err != nil {
 		return sp, fmt.Errorf("setup snapshot netns: %w", err)
 	}
@@ -132,7 +132,7 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func (s *server) createSandboxFromSnapshot(id string, subnet int) (*sandbox, error) {
+func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 	sp, err := ensureSnapshot(s.cfg)
 	if err != nil {
 		return nil, err
@@ -157,14 +157,14 @@ func (s *server) createSandboxFromSnapshot(id string, subnet int) (*sandbox, err
 		return nil, fmt.Errorf("clone snapshot base disk: %w", err)
 	}
 
-	nc, err := setupSandboxNetnsAndRouting(id, subnet, s.cfg.HostNATIface)
+	nc, err := s.acquireNetns(id)
 	if err != nil {
 		return nil, err
 	}
 	cleanupNet := true
 	defer func() {
 		if cleanupNet {
-			_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
+			s.releaseNetns(nc)
 		}
 	}()
 
@@ -250,7 +250,7 @@ func (s *server) createSandboxFromSnapshot(id string, subnet int) (*sandbox, err
 
 	return &sandbox{
 		ID:         id,
-		Subnet:     subnet,
+		Subnet:     nc.Subnet,
 		TapDevice:  nc.TapName,
 		HostIP:     nc.HostIP,
 		GuestIP:    nc.GuestIP,

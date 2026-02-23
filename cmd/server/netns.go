@@ -2,13 +2,19 @@ package main
 
 import (
 	"fmt"
-	"path/filepath"
+	"net"
+	"os"
+	"runtime"
 	"strings"
-	"time"
+
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 )
 
 type netnsConfig struct {
 	NetnsName string
+	Subnet    int
+	Pooled    bool
 
 	// Link between root netns and per-sandbox netns.
 	VethHost   string
@@ -38,22 +44,7 @@ func netnsNameForSandbox(id string) string {
 	return name
 }
 
-func runCmdNetns(ns string, name string, args ...string) (string, string, error) {
-	all := append([]string{"netns", "exec", ns, name}, args...)
-	return runCmd("ip", all...)
-}
-
-func createNetns(ns string) error {
-	_, _, err := runCmd("ip", "netns", "add", ns)
-	return err
-}
-
-func deleteNetns(ns string) error {
-	_, _, err := runCmd("ip", "netns", "del", ns)
-	return err
-}
-
-func setupSandboxNetnsAndRouting(id string, subnet int, hostIface string) (*netnsConfig, error) {
+func setupSandboxNetnsAndRouting(id string, subnet int) (*netnsConfig, error) {
 	ns := netnsNameForSandbox(id)
 
 	// Use stable interface names inside the sandbox netns so the Firecracker
@@ -73,86 +64,175 @@ func setupSandboxNetnsAndRouting(id string, subnet int, hostIface string) (*netn
 	guestIP := fmt.Sprintf("172.16.%d.2", subnet)
 	subnetCIDR := fmt.Sprintf("172.16.%d.0/30", subnet)
 
-	if err := createNetns(ns); err != nil {
+	// netns.NewNamed changes the current thread's network namespace. Make sure
+	// we restore the original namespace before doing any "root" netlink work.
+	runtime.LockOSThread()
+	origNS, err := netns.Get()
+	if err != nil {
+		runtime.UnlockOSThread()
+		return nil, fmt.Errorf("get current netns: %w", err)
+	}
+	nsHandle, err := netns.NewNamed(ns)
+	if err != nil {
+		_ = origNS.Close()
+		runtime.UnlockOSThread()
 		return nil, fmt.Errorf("create netns %q: %w", ns, err)
 	}
-	createdNS := true
-	defer func() {
-		if createdNS {
-			_ = deleteNetns(ns)
-		}
-	}()
+	// Restore the original netns for this thread before unlocking.
+	if err := netns.Set(origNS); err != nil {
+		_ = nsHandle.Close()
+		_ = origNS.Close()
+		runtime.UnlockOSThread()
+		return nil, fmt.Errorf("restore original netns after create: %w", err)
+	}
+	_ = origNS.Close()
+	runtime.UnlockOSThread()
+	defer nsHandle.Close()
 
-	// Create veth pair, move one end into the sandbox netns.
-	if _, _, err := runCmd("ip", "link", "add", vethHost, "type", "veth", "peer", "name", vethNS); err != nil {
+	rootHandle, err := netlink.NewHandle()
+	if err != nil {
+		_ = netns.DeleteNamed(ns)
+		return nil, fmt.Errorf("netlink root handle: %w", err)
+	}
+	defer rootHandle.Delete()
+
+	// Create veth pair in root namespace.
+	veth := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{Name: vethHost},
+		PeerName:  vethNS,
+	}
+	if err := rootHandle.LinkAdd(veth); err != nil {
+		_ = netns.DeleteNamed(ns)
 		return nil, fmt.Errorf("create veth pair: %w", err)
 	}
-	createdVeth := true
+	cleanupVeth := true
 	defer func() {
-		if createdVeth {
-			_, _, _ = runCmd("ip", "link", "del", vethHost)
+		if cleanupVeth {
+			if l, lerr := rootHandle.LinkByName(vethHost); lerr == nil {
+				_ = rootHandle.LinkDel(l)
+			}
 		}
 	}()
 
-	if _, _, err := runCmd("ip", "link", "set", vethNS, "netns", ns); err != nil {
-		return nil, fmt.Errorf("move veth into netns: %w", err)
+	// Move the peer into the sandbox netns.
+	peer, err := rootHandle.LinkByName(vethNS)
+	if err != nil {
+		_ = netns.DeleteNamed(ns)
+		return nil, fmt.Errorf("lookup veth peer: %w", err)
+	}
+	if err := rootHandle.LinkSetNsFd(peer, int(nsHandle)); err != nil {
+		_ = netns.DeleteNamed(ns)
+		return nil, fmt.Errorf("move veth peer into netns: %w", err)
 	}
 
-	// Root side.
-	if _, _, err := runCmd("ip", "addr", "add", vethHostIP+"/30", "dev", vethHost); err != nil {
+	// Configure root side.
+	rootVeth, err := rootHandle.LinkByName(vethHost)
+	if err != nil {
+		_ = netns.DeleteNamed(ns)
+		return nil, fmt.Errorf("lookup veth host: %w", err)
+	}
+	addrHost, err := netlink.ParseAddr(vethHostIP + "/30")
+	if err != nil {
+		_ = netns.DeleteNamed(ns)
+		return nil, err
+	}
+	if err := rootHandle.AddrAdd(rootVeth, addrHost); err != nil && !os.IsExist(err) {
 		return nil, fmt.Errorf("assign veth host ip: %w", err)
 	}
-	if _, _, err := runCmd("ip", "link", "set", vethHost, "up"); err != nil {
+	if err := rootHandle.LinkSetUp(rootVeth); err != nil {
 		return nil, fmt.Errorf("set veth host up: %w", err)
 	}
 
-	// Netns side.
-	if _, _, err := runCmdNetns(ns, "ip", "addr", "add", vethNSIP+"/30", "dev", vethNS); err != nil {
-		return nil, fmt.Errorf("assign veth ns ip: %w", err)
-	}
-	if _, _, err := runCmdNetns(ns, "ip", "link", "set", vethNS, "up"); err != nil {
-		return nil, fmt.Errorf("set veth ns up: %w", err)
-	}
-	if _, _, err := runCmdNetns(ns, "sysctl", "-w", "net.ipv4.ip_forward=1"); err != nil {
-		return nil, fmt.Errorf("enable ip_forward in netns: %w", err)
-	}
-	if _, _, err := runCmdNetns(ns, "ip", "route", "replace", "default", "via", vethHostIP, "dev", vethNS); err != nil {
-		return nil, fmt.Errorf("set netns default route: %w", err)
+	// Configure netns side (veth + routes + tap). TUN/TAP creation uses ioctls
+	// on /dev/net/tun, which operate in the *current thread's* network namespace,
+	// not the netlink handle's namespace. Do this work inside withNetns.
+	if err := withNetns(nsHandle, func() error {
+		nsHandleNL, herr := netlink.NewHandle()
+		if herr != nil {
+			return fmt.Errorf("netlink netns handle: %w", herr)
+		}
+		defer nsHandleNL.Delete()
+
+		nsVeth, herr := nsHandleNL.LinkByName(vethNS)
+		if herr != nil {
+			return fmt.Errorf("lookup veth in netns: %w", herr)
+		}
+
+		addrNS, herr := netlink.ParseAddr(vethNSIP + "/30")
+		if herr != nil {
+			return herr
+		}
+		if herr := nsHandleNL.AddrAdd(nsVeth, addrNS); herr != nil && !os.IsExist(herr) {
+			return fmt.Errorf("assign veth ns ip: %w", herr)
+		}
+		if herr := nsHandleNL.LinkSetUp(nsVeth); herr != nil {
+			return fmt.Errorf("set veth ns up: %w", herr)
+		}
+
+		if herr := os.WriteFile("/proc/sys/net/ipv4/ip_forward", []byte("1\n"), 0o644); herr != nil {
+			return fmt.Errorf("enable ip_forward in netns: %w", herr)
+		}
+		gw := net.ParseIP(vethHostIP)
+		if gw == nil {
+			return fmt.Errorf("invalid gw ip: %q", vethHostIP)
+		}
+		if herr := nsHandleNL.RouteReplace(&netlink.Route{LinkIndex: nsVeth.Attrs().Index, Gw: gw}); herr != nil {
+			return fmt.Errorf("set netns default route: %w", herr)
+		}
+
+		// Create sandbox netns tap and host endpoint IP for guest traffic.
+		tapLink := &netlink.Tuntap{
+			LinkAttrs: netlink.LinkAttrs{Name: tap},
+			Mode:      netlink.TUNTAP_MODE_TAP,
+			// Firecracker expects a TAP backend with NO_PI and typically VNET_HDR.
+			// Keep it single-queue; Firecracker config controls queueing separately.
+			Flags:  netlink.TUNTAP_NO_PI | netlink.TUNTAP_VNET_HDR | netlink.TUNTAP_ONE_QUEUE,
+			Queues: 0, // legacy branch (single queue) with our explicit Flags
+		}
+		if herr := nsHandleNL.LinkAdd(tapLink); herr != nil {
+			return fmt.Errorf("create tap: %w", herr)
+		}
+		nsTap, herr := nsHandleNL.LinkByName(tap)
+		if herr != nil {
+			return fmt.Errorf("lookup tap: %w", herr)
+		}
+		tapAddr, herr := netlink.ParseAddr(hostIP + "/30")
+		if herr != nil {
+			return herr
+		}
+		if herr := nsHandleNL.AddrAdd(nsTap, tapAddr); herr != nil && !os.IsExist(herr) {
+			return fmt.Errorf("assign tap ip: %w", herr)
+		}
+		if herr := nsHandleNL.LinkSetUp(nsTap); herr != nil {
+			return fmt.Errorf("set tap up: %w", herr)
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
 
 	// Route guest /30 subnet to the sandbox netns.
-	if _, _, err := runCmd("ip", "route", "replace", subnetCIDR, "via", vethNSIP, "dev", vethHost); err != nil {
+	_, dst, err := net.ParseCIDR(subnetCIDR)
+	if err != nil {
+		return nil, err
+	}
+	via := net.ParseIP(vethNSIP)
+	if via == nil {
+		return nil, fmt.Errorf("invalid veth ns ip: %q", vethNSIP)
+	}
+	if err := rootHandle.RouteReplace(&netlink.Route{
+		LinkIndex: rootVeth.Attrs().Index,
+		Dst:       dst,
+		Gw:        via,
+	}); err != nil {
 		return nil, fmt.Errorf("add route to guest subnet: %w", err)
 	}
 
-	// NAT guest subnet out of the host interface.
-	if _, _, err := runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", hostIface, "-j", "MASQUERADE"); err != nil {
-		return nil, fmt.Errorf("add NAT rule: %w", err)
-	}
-	natAdded := true
-	defer func() {
-		if natAdded {
-			_, _, _ = runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", hostIface, "-j", "MASQUERADE")
-		}
-	}()
-
-	// Create sandbox netns tap and host endpoint IP for guest traffic.
-	if _, _, err := runCmdNetns(ns, "ip", "tuntap", "add", tap, "mode", "tap"); err != nil {
-		return nil, fmt.Errorf("create tap: %w", err)
-	}
-	if _, _, err := runCmdNetns(ns, "ip", "addr", "add", hostIP+"/30", "dev", tap); err != nil {
-		return nil, fmt.Errorf("assign tap ip: %w", err)
-	}
-	if _, _, err := runCmdNetns(ns, "ip", "link", "set", tap, "up"); err != nil {
-		return nil, fmt.Errorf("set tap up: %w", err)
-	}
-
-	createdNS = false
-	createdVeth = false
-	natAdded = false
+	cleanupVeth = false
 
 	return &netnsConfig{
 		NetnsName:  ns,
+		Subnet:     subnet,
 		VethHost:   vethHost,
 		VethNS:     vethNS,
 		VethCIDR:   vethCIDR,
@@ -173,45 +253,30 @@ func cleanupSandboxNetnsAndRouting(cfg config, nc *netnsConfig) error {
 	var errs []string
 
 	// Best-effort cleanup. Order matters a bit:
-	// - Remove NAT + route in root netns
+	// - Remove route in root netns
 	// - Delete veth host (removes peer)
 	// - Delete netns
-	if _, _, err := runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", nc.SubnetCIDR, "-o", cfg.HostNATIface, "-j", "MASQUERADE"); err != nil {
-		errs = append(errs, fmt.Sprintf("remove NAT rule: %v", err))
-	}
 
-	if _, _, err := runCmd("ip", "route", "del", nc.SubnetCIDR); err != nil {
-		// Route may already be gone; ignore "No such process".
-		if !strings.Contains(err.Error(), "No such process") && !strings.Contains(err.Error(), "No such file") {
-			errs = append(errs, fmt.Sprintf("remove route: %v", err))
+	rootHandle, err := netlink.NewHandle()
+	if err == nil {
+		if _, dst, perr := net.ParseCIDR(nc.SubnetCIDR); perr == nil {
+			_ = rootHandle.RouteDel(&netlink.Route{Dst: dst})
 		}
-	}
-
-	if _, _, err := runCmd("ip", "link", "del", nc.VethHost); err != nil {
-		// If the netns is already gone, the veth might have disappeared too.
-		if !strings.Contains(err.Error(), "Cannot find device") {
-			errs = append(errs, fmt.Sprintf("remove veth: %v", err))
+		if l, lerr := rootHandle.LinkByName(nc.VethHost); lerr == nil {
+			_ = rootHandle.LinkDel(l)
 		}
+		rootHandle.Delete()
+	} else {
+		errs = append(errs, fmt.Sprintf("netlink root handle: %v", err))
 	}
 
 	// netns deletion removes any remaining in-netns links.
-	if err := deleteNetns(nc.NetnsName); err != nil {
-		if !strings.Contains(err.Error(), "No such file") && !strings.Contains(err.Error(), "Cannot remove namespace") {
-			errs = append(errs, fmt.Sprintf("remove netns: %v", err))
-		}
+	if err := netns.DeleteNamed(nc.NetnsName); err != nil {
+		errs = append(errs, fmt.Sprintf("remove netns: %v", err))
 	}
 
 	if len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
 	return nil
-}
-
-func sandboxPathJoin(dir, name string) string {
-	// Helper for naming files inside a per-sandbox jail directory.
-	return filepath.Join(dir, name)
-}
-
-func shortSleep() {
-	time.Sleep(25 * time.Millisecond)
 }

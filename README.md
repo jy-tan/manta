@@ -63,6 +63,7 @@ Environment variables:
 - `MANTA_FIRECRACKER_BIN` (default `firecracker`)
 - `MANTA_HOST_IFACE` (default auto-detected from default route)
 - `MANTA_WORK_DIR` (default `/tmp/manta`)
+- `MANTA_NETNS_POOL_SIZE` (default `64`; number of pre-created netns "slots"; on exhaustion, server falls back to on-demand netns creation)
 - `MANTA_ENABLE_SNAPSHOTS` (`0` default; set to `1` to restore from golden snapshot on `/create`)
 - `MANTA_EXEC_TRANSPORT` (`agent` default; `ssh` for debug fallback)
 - `MANTA_AGENT_PORT` (default `7777`)

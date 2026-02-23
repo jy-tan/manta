@@ -37,6 +37,11 @@ type config struct {
 	CgroupRoot     string
 	EnableCgroups  bool
 
+	// NetnsPoolSize controls how many pre-created netns+tap+veth "slots" we keep
+	// around. When >0, /create acquires a slot instead of building netns/veth/tap
+	// from scratch.
+	NetnsPoolSize int
+
 	// EnableSnapshots switches /create from "boot fresh VM" to "restore from a
 	// golden snapshot". Snapshotting requires Firecracker snapshot support.
 	EnableSnapshots bool
@@ -87,6 +92,7 @@ type server struct {
 	nextSandboxID uint64
 	nextSubnet    uint32
 	sandboxes     map[string]*sandbox
+	netnsPool     *netnsPool
 }
 
 type createResponse struct {
@@ -145,6 +151,19 @@ func main() {
 		sandboxes: make(map[string]*sandbox),
 	}
 
+	// Install one broad NAT rule once; keep it for server lifetime.
+	if err := ensureGlobalMasquerade(cfg.HostNATIface); err != nil {
+		log.Fatalf("ensure global MASQUERADE: %v", err)
+	}
+
+	// Initialize netns pool if enabled.
+	if cfg.NetnsPoolSize > 0 {
+		srv.netnsPool = newNetnsPool(cfg, cfg.NetnsPoolSize)
+		if err := srv.netnsPool.Init(); err != nil {
+			log.Fatalf("init netns pool: %v", err)
+		}
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /create", srv.handleCreate)
 	mux.HandleFunc("POST /exec", srv.handleExec)
@@ -177,6 +196,9 @@ func main() {
 	if err := httpServer.Shutdown(ctx); err != nil {
 		log.Printf("http shutdown error: %v", err)
 	}
+	if srv.netnsPool != nil {
+		srv.netnsPool.Destroy()
+	}
 	srv.destroyAll()
 }
 
@@ -190,6 +212,7 @@ func loadConfig() (config, error) {
 		WorkDir:         envOr("MANTA_WORK_DIR", "/tmp/manta"),
 		CgroupRoot:      envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
 		EnableCgroups:   intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
+		NetnsPoolSize:   intOr("MANTA_NETNS_POOL_SIZE", 64),
 		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 0) != 0,
 		ExecTransport:   strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
 
@@ -256,6 +279,12 @@ func ensurePreflight(cfg config) error {
 		return fmt.Errorf("enable ip_forward: %w", err)
 	}
 
+	// Ensure NAT is configured once so sandbox creation doesn't churn iptables.
+	// This is intentionally a broad rule covering all guest subnets.
+	if err := ensureGlobalMasquerade(cfg.HostNATIface); err != nil {
+		return fmt.Errorf("ensure global MASQUERADE: %w", err)
+	}
+
 	if cfg.EnableCgroups {
 		if err := ensureCgroupRoot(cfg.CgroupRoot); err != nil {
 			log.Printf("cgroups disabled (falling back to process groups only): %v", err)
@@ -275,9 +304,7 @@ func ensurePreflight(cfg config) error {
 
 func (s *server) handleCreate(w http.ResponseWriter, _ *http.Request) {
 	id := fmt.Sprintf("sb-%d", atomic.AddUint64(&s.nextSandboxID, 1))
-	subnet := int(atomic.AddUint32(&s.nextSubnet, 1))
-
-	sb, err := s.createSandbox(id, subnet)
+	sb, err := s.createSandbox(id)
 	if err != nil {
 		log.Printf("create %s failed: %v", id, err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
@@ -467,9 +494,9 @@ func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, destroyResponse{Status: "ok"})
 }
 
-func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
+func (s *server) createSandbox(id string) (*sandbox, error) {
 	if s.cfg.EnableSnapshots {
-		return s.createSandboxFromSnapshot(id, subnet)
+		return s.createSandboxFromSnapshot(id)
 	}
 
 	sbDir := filepath.Join(s.cfg.WorkDir, "sandboxes", id)
@@ -483,14 +510,14 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		}
 	}()
 
-	nc, err := setupSandboxNetnsAndRouting(id, subnet, s.cfg.HostNATIface)
+	nc, err := s.acquireNetns(id)
 	if err != nil {
 		return nil, err
 	}
 	cleanupNet := true
 	defer func() {
 		if cleanupNet {
-			_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
+			s.releaseNetns(nc)
 		}
 	}()
 
@@ -501,7 +528,7 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 
 	configPath := filepath.Join(sbDir, "vm-config.json")
 	// Use stable, relative paths inside the per-sandbox jail dir.
-	if err := writeVMConfig(configPath, s.cfg, nc.TapName, "rootfs.ext4", subnet, "vsock.sock", uint32(1000+subnet)); err != nil {
+	if err := writeVMConfig(configPath, s.cfg, nc.TapName, "rootfs.ext4", nc.Subnet, "vsock.sock", uint32(1000+nc.Subnet)); err != nil {
 		return nil, fmt.Errorf("write vm config: %w", err)
 	}
 	socketPath := filepath.Join(sbDir, "firecracker.sock")
@@ -578,13 +605,13 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 	cleanupNet = false
 	cleanupDir = false
 
-	return &sandbox{
+	sb := &sandbox{
 		ID:         id,
-		Subnet:     subnet,
+		Subnet:     nc.Subnet,
 		TapDevice:  nc.TapName,
 		HostIP:     nc.HostIP,
 		GuestIP:    nc.GuestIP,
-		GuestCID:   uint32(1000 + subnet),
+		GuestCID:   uint32(1000 + nc.Subnet),
 		Netns:      nc,
 		Dir:        sbDir,
 		SocketPath: socketPath,
@@ -595,7 +622,8 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		CgroupPath: cgroupPath,
 		Process:    fcCmd,
 		Agent:      ac,
-	}, nil
+	}
+	return sb, nil
 }
 
 func (s *server) cleanupSandbox(sb *sandbox) error {
@@ -646,9 +674,8 @@ func (s *server) cleanupSandbox(sb *sandbox) error {
 		}
 	}
 
-	if err := cleanupSandboxNetnsAndRouting(s.cfg, sb.Netns); err != nil {
-		errs = append(errs, fmt.Sprintf("cleanup netns: %v", err))
-	}
+	s.releaseNetns(sb.Netns)
+	sb.Netns = nil
 
 	if err := os.RemoveAll(sb.Dir); err != nil {
 		errs = append(errs, fmt.Sprintf("remove sandbox dir: %v", err))
