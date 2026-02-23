@@ -1,0 +1,32 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Common Go binaries (this repo builds cmd/server + cmd/bench)
+server
+!cmd/server/
+
+# Go workspace/tooling
+/vendor/
+/.idea/
+/.vscode/
+
+# Guest build artifacts (kernel/rootfs/ssh keys)
+/guest-artifacts/
+
+# Benchmark outputs
+/results/
+
+# OS/editor noise
+.DS_Store
+*~
+*.swp
+*.swo
+
+# Logs
+*.log
