@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"manta/internal/agentrpc"
 )
 
 type config struct {
@@ -34,13 +36,24 @@ type config struct {
 	WorkDir        string
 	CgroupRoot     string
 	EnableCgroups  bool
-	SSHWaitTimeout time.Duration
-	SSHDialTimeout time.Duration
-	SSHExecWait    time.Duration
-	ExecTimeout    time.Duration
-	BootArgs       string
-	DefaultMemMiB  int
-	DefaultVCPU    int
+
+	// ExecTransport controls how /exec runs commands inside the guest.
+	// Supported: "agent" (vsock RPC), "ssh" (debug fallback).
+	ExecTransport string
+
+	// Agent controls readiness + RPC dialing for the in-guest agent.
+	AgentPort        int
+	AgentWaitTimeout time.Duration
+	AgentDialTimeout time.Duration
+	AgentCallTimeout time.Duration
+	AgentMaxOutputB  int64
+	SSHWaitTimeout   time.Duration
+	SSHDialTimeout   time.Duration
+	SSHExecWait      time.Duration
+	ExecTimeout      time.Duration
+	BootArgs         string
+	DefaultMemMiB    int
+	DefaultVCPU      int
 }
 
 type sandbox struct {
@@ -49,14 +62,18 @@ type sandbox struct {
 	TapDevice  string
 	HostIP     string
 	GuestIP    string
+	GuestCID   uint32
 	Dir        string
 	SocketPath string
+	VsockPath  string
 	ConfigPath string
 	RootfsPath string
 	LogPath    string
 	CgroupPath string
 	Process    *exec.Cmd
-	SSHClient  *ssh.Client
+	SSHClient  *ssh.Client // debug-only; exec path no longer depends on SSH
+	Agent      *agentConn
+	agentMu    sync.Mutex
 }
 
 type server struct {
@@ -73,7 +90,19 @@ type createResponse struct {
 
 type execRequest struct {
 	SandboxID string `json:"sandbox_id"`
-	Cmd       string `json:"cmd"`
+	// Shell mode (default for backward compatibility): run /bin/sh -lc <cmd>.
+	Cmd string `json:"cmd,omitempty"`
+
+	// No-shell mode: run argv directly (execve-style).
+	Argv []string `json:"argv,omitempty"`
+
+	// Optional explicit switch. If omitted:
+	// - cmd => use_shell=true
+	// - argv => use_shell=false
+	UseShell *bool `json:"use_shell,omitempty"`
+
+	// Optional per-request timeout override. 0 uses server default.
+	TimeoutMs int64 `json:"timeout_ms,omitempty"`
 }
 
 type execResponse struct {
@@ -156,6 +185,14 @@ func loadConfig() (config, error) {
 		WorkDir:        envOr("MANTA_WORK_DIR", "/tmp/manta"),
 		CgroupRoot:     envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
 		EnableCgroups:  intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
+		ExecTransport:  strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
+
+		AgentPort:        intOr("MANTA_AGENT_PORT", agentrpc.DefaultPort),
+		AgentWaitTimeout: durationOr("MANTA_AGENT_WAIT_TIMEOUT", 30*time.Second),
+		AgentDialTimeout: durationOr("MANTA_AGENT_DIAL_TIMEOUT", 250*time.Millisecond),
+		AgentCallTimeout: durationOr("MANTA_AGENT_CALL_TIMEOUT", 20*time.Second),
+		AgentMaxOutputB:  int64(intOr("MANTA_AGENT_MAX_OUTPUT_BYTES", 1<<20)),
+
 		SSHWaitTimeout: durationOr("MANTA_SSH_WAIT_TIMEOUT", 30*time.Second),
 		SSHDialTimeout: durationOr("MANTA_SSH_DIAL_TIMEOUT", 2*time.Second),
 		SSHExecWait:    durationOr("MANTA_SSH_EXEC_WAIT_TIMEOUT", 20*time.Second),
@@ -237,8 +274,9 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	if strings.TrimSpace(req.SandboxID) == "" || strings.TrimSpace(req.Cmd) == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sandbox_id and cmd are required"})
+
+	if strings.TrimSpace(req.SandboxID) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sandbox_id is required"})
 		return
 	}
 
@@ -251,31 +289,129 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sshClient, err := waitForExecSSH(sb.GuestIP, s.cfg.SSHPrivateKey, s.cfg.SSHExecWait, s.cfg.SSHDialTimeout)
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("ssh dial failed: %v", err)})
+	timeout := s.cfg.ExecTimeout
+	if req.TimeoutMs > 0 {
+		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
+	}
+
+	cmd := strings.TrimSpace(req.Cmd)
+	useShell := false
+	switch {
+	case len(req.Argv) > 0:
+		if cmd != "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "provide either cmd or argv, not both"})
+			return
+		}
+		useShell = false
+		if req.UseShell != nil && *req.UseShell {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "use_shell=true is not valid with argv"})
+			return
+		}
+	case cmd != "":
+		useShell = true
+		if req.UseShell != nil && !*req.UseShell {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "use_shell=false is not valid with cmd; provide argv instead"})
+			return
+		}
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cmd or argv is required"})
 		return
 	}
-	defer sshClient.Close()
 
-	session, err := sshClient.NewSession()
-	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("new ssh session: %v", err)})
+	switch s.cfg.ExecTransport {
+	case "ssh":
+		if !useShell {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ssh transport only supports cmd (shell mode)"})
+			return
+		}
+
+		sshClient, err := waitForExecSSH(sb.GuestIP, s.cfg.SSHPrivateKey, s.cfg.SSHExecWait, s.cfg.SSHDialTimeout)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("ssh dial failed: %v", err)})
+			return
+		}
+		defer sshClient.Close()
+
+		session, err := sshClient.NewSession()
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("new ssh session: %v", err)})
+			return
+		}
+		defer session.Close()
+
+		var stdout, stderr bytes.Buffer
+		exitCode, err := runSSHCommand(session, cmd, &stdout, &stderr, timeout)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("exec failed: %v", err)})
+			return
+		}
+		writeJSON(w, http.StatusOK, execResponse{Stdout: stdout.String(), Stderr: stderr.String(), ExitCode: exitCode})
+		return
+
+	case "agent", "":
+		// ok
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("unknown exec transport %q", s.cfg.ExecTransport)})
 		return
 	}
-	defer session.Close()
 
-	var stdout, stderr bytes.Buffer
-	exitCode, err := runSSHCommand(session, req.Cmd, &stdout, &stderr, s.cfg.ExecTimeout)
+	sb.agentMu.Lock()
+	defer sb.agentMu.Unlock()
+
+	// Prefer a persistent agent connection, but transparently redial if needed.
+	ac := sb.Agent
+	if ac == nil {
+		newAC, err := dialAgent(sb.VsockPath, s.cfg.AgentPort, s.cfg.AgentDialTimeout)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("agent dial failed: %v", err)})
+			return
+		}
+		sb.Agent = newAC
+		ac = newAC
+	}
+
+	resp, err := ac.Call(agentrpc.Request{
+		Type: "exec",
+		Exec: &agentrpc.ExecRequest{
+			UseShell:       useShell,
+			Cmd:            cmd,
+			Argv:           req.Argv,
+			TimeoutMs:      timeout.Milliseconds(),
+			MaxOutputBytes: s.cfg.AgentMaxOutputB,
+		},
+	}, s.cfg.AgentCallTimeout)
 	if err != nil {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("exec failed: %v", err)})
-		return
+		// Retry once on likely broken connection.
+		_ = ac.Close()
+		sb.Agent = nil
+
+		newAC, derr := dialAgent(sb.VsockPath, s.cfg.AgentPort, s.cfg.AgentDialTimeout)
+		if derr != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("agent dial failed: %v (original error: %v)", derr, err)})
+			return
+		}
+		sb.Agent = newAC
+
+		resp, err = newAC.Call(agentrpc.Request{
+			Type: "exec",
+			Exec: &agentrpc.ExecRequest{
+				UseShell:       useShell,
+				Cmd:            cmd,
+				Argv:           req.Argv,
+				TimeoutMs:      timeout.Milliseconds(),
+				MaxOutputBytes: s.cfg.AgentMaxOutputB,
+			},
+		}, s.cfg.AgentCallTimeout)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("agent exec failed: %v", err)})
+			return
+		}
 	}
 
 	writeJSON(w, http.StatusOK, execResponse{
-		Stdout:   stdout.String(),
-		Stderr:   stderr.String(),
-		ExitCode: exitCode,
+		Stdout:   resp.Exec.Stdout,
+		Stderr:   resp.Exec.Stderr,
+		ExitCode: resp.Exec.ExitCode,
 	})
 }
 
@@ -350,12 +486,12 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		return nil, fmt.Errorf("copy rootfs: %w", err)
 	}
 
-	if err := updateNetworkConfig(rootfsCopy, guestIP, hostIP); err != nil {
-		return nil, fmt.Errorf("update rootfs network config: %w", err)
-	}
-
 	configPath := filepath.Join(sbDir, "vm-config.json")
-	if err := writeVMConfig(configPath, s.cfg, tap, rootfsCopy, subnet); err != nil {
+	vsockPath := filepath.Join(sbDir, "vsock.sock")
+	_ = os.Remove(vsockPath)
+	guestCID := uint32(1000 + subnet)
+
+	if err := writeVMConfig(configPath, s.cfg, tap, rootfsCopy, subnet, vsockPath, guestCID); err != nil {
 		return nil, fmt.Errorf("write vm config: %w", err)
 	}
 	socketPath := filepath.Join(sbDir, "firecracker.sock")
@@ -395,7 +531,7 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		}
 	}
 
-	sshClient, err := waitForSSH(guestIP, s.cfg.SSHPrivateKey, s.cfg.SSHWaitTimeout, s.cfg.SSHDialTimeout)
+	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
 	if err != nil {
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
@@ -404,7 +540,29 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		_, _, _ = runCmd("ip", "link", "del", tap)
 		cleanupTap = false
 		_ = logFile.Close()
-		return nil, fmt.Errorf("wait for ssh: %w", err)
+		return nil, fmt.Errorf("wait for agent: %w", err)
+	}
+
+	// Configure per-sandbox networking inside the guest via vsock so /create
+	// doesn't depend on SSHD or disk mutation of /etc/network/interfaces.
+	if _, err := ac.Call(agentrpc.Request{
+		Type: "net",
+		Net: &agentrpc.NetRequest{
+			Interface: "eth0",
+			Address:   guestIP + "/30",
+			Gateway:   hostIP,
+			DNS:       "1.1.1.1",
+		},
+	}, 5*time.Second); err != nil {
+		_ = ac.Close()
+		_ = killProcessGroup(fcCmd)
+		_ = killCgroup(cgroupPath)
+		_, _, _ = runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE")
+		natAdded = false
+		_, _, _ = runCmd("ip", "link", "del", tap)
+		cleanupTap = false
+		_ = logFile.Close()
+		return nil, fmt.Errorf("agent network config failed: %w", err)
 	}
 
 	_ = logFile.Close()
@@ -417,19 +575,28 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		TapDevice:  tap,
 		HostIP:     hostIP,
 		GuestIP:    guestIP,
+		GuestCID:   guestCID,
 		Dir:        sbDir,
 		SocketPath: socketPath,
+		VsockPath:  vsockPath,
 		ConfigPath: configPath,
 		RootfsPath: rootfsCopy,
 		LogPath:    logPath,
 		CgroupPath: cgroupPath,
 		Process:    fcCmd,
-		SSHClient:  sshClient,
+		Agent:      ac,
 	}, nil
 }
 
 func (s *server) cleanupSandbox(sb *sandbox) error {
 	var errs []string
+
+	sb.agentMu.Lock()
+	if sb.Agent != nil {
+		_ = sb.Agent.Close()
+		sb.Agent = nil
+	}
+	sb.agentMu.Unlock()
 
 	if sb.SSHClient != nil {
 		_ = sb.SSHClient.Close()
@@ -727,7 +894,7 @@ iface eth0 inet static
 	return nil
 }
 
-func writeVMConfig(configPath string, cfg config, tapDevice, rootfsPath string, subnet int) error {
+func writeVMConfig(configPath string, cfg config, tapDevice, rootfsPath string, subnet int, vsockPath string, guestCID uint32) error {
 	type bootSource struct {
 		KernelImagePath string `json:"kernel_image_path"`
 		BootArgs        string `json:"boot_args"`
@@ -746,6 +913,10 @@ func writeVMConfig(configPath string, cfg config, tapDevice, rootfsPath string, 
 	type machineConfig struct {
 		VCPUCount  int `json:"vcpu_count"`
 		MemSizeMiB int `json:"mem_size_mib"`
+	}
+	type vsockConfig struct {
+		GuestCID uint32 `json:"guest_cid"`
+		UDSPath  string `json:"uds_path"`
 	}
 
 	guestMAC := fmt.Sprintf("06:00:AC:10:%02X:%02X", (subnet>>8)&0xFF, subnet&0xFF)
@@ -773,6 +944,10 @@ func writeVMConfig(configPath string, cfg config, tapDevice, rootfsPath string, 
 		"machine-config": machineConfig{
 			VCPUCount:  cfg.DefaultVCPU,
 			MemSizeMiB: cfg.DefaultMemMiB,
+		},
+		"vsock": vsockConfig{
+			GuestCID: guestCID,
+			UDSPath:  vsockPath,
 		},
 	}
 

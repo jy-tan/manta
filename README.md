@@ -4,8 +4,8 @@ Simple sandbox orchestrator for Firecracker microVMs.
 
 ## What it does
 
-- `POST /create`: boots a new microVM and waits for SSH.
-- `POST /exec`: runs a command in the VM via SSH.
+- `POST /create`: boots a new microVM and waits for the in-guest agent (vsock RPC).
+- `POST /exec`: runs a command in the VM via the agent (vsock RPC). SSH is kept as a debug fallback.
 - `POST /destroy`: tears down the VM and host networking state.
 
 ## Prerequisites
@@ -42,12 +42,13 @@ You should end up with:
 
 - `guest-artifacts/vmlinux`
 - `guest-artifacts/rootfs.ext4`
+- `guest-artifacts/manta-agent`
 - `guest-artifacts/sandbox_key`
 - `guest-artifacts/sandbox_key.pub`
 
 ## Run server
 
-Server needs root privileges for tap devices, NAT rules, and rootfs mount operations.
+Server needs root privileges for tap devices and NAT rules.
 
 ```bash
 sudo go run ./cmd/server
@@ -62,6 +63,11 @@ Environment variables:
 - `MANTA_FIRECRACKER_BIN` (default `firecracker`)
 - `MANTA_HOST_IFACE` (default auto-detected from default route)
 - `MANTA_WORK_DIR` (default `/tmp/manta`)
+- `MANTA_EXEC_TRANSPORT` (`agent` default; `ssh` for debug fallback)
+- `MANTA_AGENT_PORT` (default `7777`)
+- `MANTA_AGENT_WAIT_TIMEOUT` (default `30s`)
+- `MANTA_AGENT_DIAL_TIMEOUT` (default `250ms`)
+- `MANTA_AGENT_CALL_TIMEOUT` (default `20s`)
 
 ## API examples
 

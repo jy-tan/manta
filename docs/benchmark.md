@@ -17,13 +17,22 @@ This follows the [ComputeSDK benchmarks](https://github.com/computesdk/benchmark
 
 For now, we'll optimize and benchmark locally until this project is in a deployable state.
 
+### What "Ready" Means
+
+In the current implementation, "ready" during `POST /create` means:
+
+- Firecracker has booted the guest far enough that the in-guest agent (`manta-agent`) responds to a vsock `ping`.
+- The host configures per-sandbox guest networking (IP address, default route, DNS) by sending a vsock RPC request to that agent.
+
+This is a fast and deterministic readiness signal, but it is not the same as "everything the user might do is warmed/verified". For example, we do not attempt to validate outbound internet access (NAT + DNS + egress) beyond applying config, and we do not warm language runtimes or package caches.
+
 ## Prerequisites
 
 You need the same prerequisites as running the server, plus a stable host environment:
 
 - Linux host with KVM (`/dev/kvm`)
 - Firecracker binary available (or set `MANTA_FIRECRACKER_BIN`)
-- Root privileges to run the server (tap devices, NAT rules, mount/umount rootfs)
+- Root privileges to run the server (tap devices, NAT rules)
 - Built guest artifacts: `guest-artifacts/vmlinux` and `guest-artifacts/rootfs.ext4`
 
 ## Running the Benchmark
@@ -69,11 +78,12 @@ Each iteration follows the same lifecycle:
 This means your results include:
 
 - Host networking setup time (tap + iptables NAT)
-- Rootfs clone and modification time
+- Rootfs clone time
 - Firecracker startup time
 - Guest boot time
-- Time until SSH can execute a trivial command
-- SSH dial + first command execution
+- Time until the vsock agent is responding to `ping`
+- Guest network configuration via vsock RPC
+- First command execution via vsock RPC
 
 ## Output Format
 

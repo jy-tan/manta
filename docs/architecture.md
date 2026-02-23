@@ -29,7 +29,7 @@ At a high level, this is a single-host control plane plus one microVM per sandbo
 - **Isolation runtime:** Firecracker process per sandbox
 - **Guest OS artifacts:** shared kernel + base rootfs image
 - **Per-sandbox writable disk:** cloned rootfs per VM
-- **Command transport:** SSH from host control plane into guest
+- **Command transport:** vsock RPC to an in-guest agent (default); SSH is kept for debugging
 - **Network path:** per-sandbox host tap device + tiny `/30` subnet + host NAT (`iptables MASQUERADE`) for outbound internet access
 
 ### Architecture Diagram
@@ -49,16 +49,18 @@ graph TB
   subgraph Guest["microVM (guest)"]
     Kernel["Linux kernel (vmlinux)"]
     Rootfs["Alpine root filesystem (ext4)"]
-    SSHD["sshd"]
+    Agent["manta-agent (vsock RPC)"]
+    SSHD["sshd (debug)"]
     Workload["User workload(command execution)"]
   end
 
   Client -->|HTTP JSON| APIServer
 
   APIServer -->|ip + iptables| Net
-  APIServer -->|cp --reflink=auto + customize| PerSandboxDisk
+  APIServer -->|cp --reflink=auto| PerSandboxDisk
   APIServer -->|write vm-config.json| FC
-  APIServer -->|SSH| SSHD
+  APIServer -->|vsock RPC| Agent
+  APIServer -.->|SSH (debug)| SSHD
 
   Artifacts --> FC
   Artifacts --> PerSandboxDisk
@@ -67,8 +69,9 @@ graph TB
 
   FC -->|boots| Kernel
   Kernel --> Rootfs
-  Rootfs --> SSHD
-  SSHD --> Workload
+  Rootfs --> Agent
+  Rootfs -.-> SSHD
+  Agent --> Workload
 ```
 
 ### Data Flow Diagram
@@ -79,20 +82,20 @@ sequenceDiagram
   participant S as API server
   participant H as Host OS (net/fs)
   participant F as Firecracker
-  participant G as Guest (sshd)
+  participant G as Guest (manta-agent)
 
   C->>S: POST /create
   S->>H: Create tap + assign IP
   S->>H: Add NAT rule (iptables MASQUERADE)
-  S->>H: Clone rootfs + write guest net config
+  S->>H: Clone rootfs
   S->>H: Write Firecracker config JSON
   S->>F: Start Firecracker process
-  S->>G: Wait for SSH readiness (poll + "true")
+  S->>G: Wait for agent readiness (vsock ping)
+  S->>G: Configure guest network (ip addr/route + DNS)
   S-->>C: 200 {sandbox_id}
 
   C->>S: POST /exec {sandbox_id, cmd}
-  S->>G: Dial SSH (retry window)
-  S->>G: Run command (timeout enforced)
+  S->>G: RPC exec request (timeout enforced)
   S-->>C: 200 {stdout, stderr, exit_code}
 
   C->>S: POST /destroy {sandbox_id}
@@ -105,17 +108,18 @@ sequenceDiagram
 
 1. Client calls `POST /create`
 2. Server allocates host networking (tap + `/30` subnet + NAT)
-3. Server clones rootfs for sandbox and writes guest network config
-4. Server writes Firecracker config JSON
+3. Server clones rootfs for sandbox
+4. Server writes Firecracker config JSON (including vsock device)
 5. Server starts Firecracker process
-6. Server waits for SSH readiness in guest
-7. Server returns `sandbox_id`
-8. Client calls `POST /exec` with command
-9. Server dials SSH, executes command, returns stdout/stderr/exit code
-10. Client calls `POST /destroy`
-11. Server kills VM process and cleans networking + files
+6. Server waits for agent readiness in guest (vsock ping)
+7. Server configures per-sandbox guest networking via agent
+8. Server returns `sandbox_id`
+9. Client calls `POST /exec` with command
+10. Server sends exec request to agent and returns stdout/stderr/exit code
+11. Client calls `POST /destroy`
+12. Server kills VM process and cleans networking + files
 
-## Key Components and Why They Exist
+## Key Components
 
 ### API Server (`cmd/server/main.go`)
 
@@ -128,7 +132,7 @@ Responsibilities:
 - Maintains in-memory sandbox map and IDs
 - Runs host commands for network setup and cleanup
 - Starts/stops Firecracker processes
-- Handles SSH readiness and command execution
+- Handles agent readiness (vsock ping) and command execution (vsock RPC)
 
 ### Firecracker Runtime
 
@@ -156,9 +160,10 @@ Builds Alpine-based `rootfs.ext4` and SSH key artifacts. This provides the root 
 What it includes:
 
 - OpenRC init setup
-- `openssh-server`
+- `manta-agent` (vsock RPC server) enabled on boot
+- `openssh-server` (debug access)
 - Base utilities + optional tooling (`python3`, `nodejs`, `npm`, etc.)
-- Network interface defaults and DNS
+- `iproute2` for runtime network configuration
 
 ### Per-Sandbox Rootfs Clone
 
@@ -166,24 +171,22 @@ On each create, Manta copies the base rootfs to a sandbox-specific file using:
 
 - `cp --reflink=auto ...`
 
-Then it customizes network config inside that copy.
-
 Why required:
 
 - Each VM needs writable disk state isolated from other VMs.
 
-### SSH Command Channel
+### Agent Command Channel (vsock RPC)
 
-`/exec` uses SSH to run a command in guest and return outputs.
+`/exec` sends an RPC request over Firecracker vsock to an in-guest agent which runs the command and returns stdout/stderr/exit code.
 
 Why required:
 
-- It avoids building a custom guest agent protocol in the minimum version.
-- SSH is battle-tested and easy to integrate from Go.
+- It avoids SSH handshake overhead and makes readiness deterministic.
+- It enables post-boot configuration (like per-sandbox networking) without mutating the rootfs image on disk.
 
 Trade-off:
 
-- Extra handshake and protocol overhead vs specialized agents.
+- Requires a small amount of custom code inside the guest (the agent binary and init service).
 
 ### Host Networking Layer
 
@@ -196,7 +199,7 @@ Per sandbox:
 
 What this means:
 
-- **tap device (per-sandbox):** a host-side virtual Ethernet interface created for a single microVM. Firecracker attaches the VM's virtual NIC to this tap, giving the host a direct L2 link to the guest (used for SSH and for routing guest traffic).
+- **tap device (per-sandbox):** a host-side virtual Ethernet interface created for a single microVM. Firecracker attaches the VM's virtual NIC to this tap, giving the host a direct L2 link used for guest egress traffic (and optional debug SSH access).
 - **`/30` subnet:** CIDR mask `255.255.255.252` (4 IPs total, 2 usable). Manta uses it like a point-to-point link:
   - subnet: `172.16.X.0/30`
   - host (tap) IP: `172.16.X.1`
@@ -206,22 +209,8 @@ What this means:
 Host vs guest configuration:
 
 - **On the host:** create the tap, assign the host IP, enable IPv4 forwarding, and add/remove the NAT rule.
-- **In the guest (microVM):** the network interface still needs configuration (IP address, netmask, default gateway, DNS). Manta writes this into the per-sandbox rootfs during create (e.g. `/etc/network/interfaces` and `/etc/resolv.conf`) so the guest boots with `eth0` configured and a default route via the host tap IP.
+- **In the guest (microVM):** the network interface still needs configuration (IP address, netmask, default gateway, DNS). Manta configures this post-boot via vsock RPC by running `ip addr/route` commands in the guest through the agent.
 
 Why required:
 
-- Control plane needs a path to reach guest SSH.
 - Guest workloads need outbound network access.
-
-## The Bare Minimum
-
-For a single-host sandbox provider simulation, this is close to the minimum practical stack:
-
-- API surface for lifecycle
-- VM-based isolation primitive
-- Bootable guest image
-- Remote command execution path
-- Basic per-sandbox networking and cleanup
-- Measurement loop
-
-This is enough to simulate the core product behavior: "Create sandbox -> run arbitrary command -> destroy sandbox". It simply proves the core lifecycle and provides the benchmark baseline.
