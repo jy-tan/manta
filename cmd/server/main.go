@@ -37,6 +37,10 @@ type config struct {
 	CgroupRoot     string
 	EnableCgroups  bool
 
+	// EnableSnapshots switches /create from "boot fresh VM" to "restore from a
+	// golden snapshot". Snapshotting requires Firecracker snapshot support.
+	EnableSnapshots bool
+
 	// ExecTransport controls how /exec runs commands inside the guest.
 	// Supported: "agent" (vsock RPC), "ssh" (debug fallback).
 	ExecTransport string
@@ -63,6 +67,7 @@ type sandbox struct {
 	HostIP     string
 	GuestIP    string
 	GuestCID   uint32
+	Netns      *netnsConfig
 	Dir        string
 	SocketPath string
 	VsockPath  string
@@ -177,15 +182,16 @@ func main() {
 
 func loadConfig() (config, error) {
 	cfg := config{
-		ListenAddr:     envOr("MANTA_LISTEN_ADDR", ":8080"),
-		KernelPath:     envOr("MANTA_KERNEL_PATH", "./guest-artifacts/vmlinux"),
-		BaseRootfsPath: envOr("MANTA_ROOTFS_PATH", "./guest-artifacts/rootfs.ext4"),
-		SSHPrivateKey:  envOr("MANTA_SSH_KEY_PATH", "./guest-artifacts/sandbox_key"),
-		FirecrackerBin: envOr("MANTA_FIRECRACKER_BIN", "firecracker"),
-		WorkDir:        envOr("MANTA_WORK_DIR", "/tmp/manta"),
-		CgroupRoot:     envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
-		EnableCgroups:  intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
-		ExecTransport:  strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
+		ListenAddr:      envOr("MANTA_LISTEN_ADDR", ":8080"),
+		KernelPath:      envOr("MANTA_KERNEL_PATH", "./guest-artifacts/vmlinux"),
+		BaseRootfsPath:  envOr("MANTA_ROOTFS_PATH", "./guest-artifacts/rootfs.ext4"),
+		SSHPrivateKey:   envOr("MANTA_SSH_KEY_PATH", "./guest-artifacts/sandbox_key"),
+		FirecrackerBin:  envOr("MANTA_FIRECRACKER_BIN", "firecracker"),
+		WorkDir:         envOr("MANTA_WORK_DIR", "/tmp/manta"),
+		CgroupRoot:      envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
+		EnableCgroups:   intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
+		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 0) != 0,
+		ExecTransport:   strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
 
 		AgentPort:        intOr("MANTA_AGENT_PORT", agentrpc.DefaultPort),
 		AgentWaitTimeout: durationOr("MANTA_AGENT_WAIT_TIMEOUT", 30*time.Second),
@@ -203,6 +209,17 @@ func loadConfig() (config, error) {
 		),
 		DefaultMemMiB: intOr("MANTA_VM_MEM_MIB", 512),
 		DefaultVCPU:   intOr("MANTA_VM_VCPU", 1),
+	}
+
+	// Firecracker is started with its working directory set to a per-sandbox
+	// jail dir. Resolve any relative artifact paths now so they remain valid
+	// regardless of cwd.
+	for _, p := range []*string{&cfg.KernelPath, &cfg.BaseRootfsPath, &cfg.SSHPrivateKey} {
+		abs, err := filepath.Abs(*p)
+		if err != nil {
+			return cfg, fmt.Errorf("resolve path %q: %w", *p, err)
+		}
+		*p = abs
 	}
 
 	if cfg.HostNATIface = strings.TrimSpace(os.Getenv("MANTA_HOST_IFACE")); cfg.HostNATIface == "" {
@@ -244,6 +261,12 @@ func ensurePreflight(cfg config) error {
 			log.Printf("cgroups disabled (falling back to process groups only): %v", err)
 		} else {
 			scavengeCgroups(cfg.CgroupRoot)
+		}
+	}
+
+	if cfg.EnableSnapshots {
+		if _, err := ensureSnapshot(cfg); err != nil {
+			return fmt.Errorf("ensure snapshot: %w", err)
 		}
 	}
 
@@ -445,39 +468,29 @@ func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
+	if s.cfg.EnableSnapshots {
+		return s.createSandboxFromSnapshot(id, subnet)
+	}
+
 	sbDir := filepath.Join(s.cfg.WorkDir, "sandboxes", id)
 	if err := os.MkdirAll(sbDir, 0o755); err != nil {
 		return nil, fmt.Errorf("create sandbox dir: %w", err)
 	}
-
-	tap := "tap-" + id
-	hostIP := fmt.Sprintf("172.16.%d.1", subnet)
-	guestIP := fmt.Sprintf("172.16.%d.2", subnet)
-	subnetCIDR := fmt.Sprintf("172.16.%d.0/30", subnet)
-
-	if _, _, err := runCmd("ip", "tuntap", "add", tap, "mode", "tap"); err != nil {
-		return nil, fmt.Errorf("create tap: %w", err)
-	}
-	cleanupTap := true
+	cleanupDir := true
 	defer func() {
-		if cleanupTap {
-			_, _, _ = runCmd("ip", "link", "del", tap)
+		if cleanupDir {
+			_ = os.RemoveAll(sbDir)
 		}
 	}()
 
-	if _, _, err := runCmd("ip", "addr", "add", hostIP+"/30", "dev", tap); err != nil {
-		return nil, fmt.Errorf("assign tap ip: %w", err)
+	nc, err := setupSandboxNetnsAndRouting(id, subnet, s.cfg.HostNATIface)
+	if err != nil {
+		return nil, err
 	}
-	if _, _, err := runCmd("ip", "link", "set", tap, "up"); err != nil {
-		return nil, fmt.Errorf("set tap up: %w", err)
-	}
-	if _, _, err := runCmd("iptables", "-t", "nat", "-A", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE"); err != nil {
-		return nil, fmt.Errorf("add NAT rule: %w", err)
-	}
-	natAdded := true
+	cleanupNet := true
 	defer func() {
-		if natAdded {
-			_, _, _ = runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE")
+		if cleanupNet {
+			_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
 		}
 	}()
 
@@ -487,15 +500,13 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 	}
 
 	configPath := filepath.Join(sbDir, "vm-config.json")
-	vsockPath := filepath.Join(sbDir, "vsock.sock")
-	_ = os.Remove(vsockPath)
-	guestCID := uint32(1000 + subnet)
-
-	if err := writeVMConfig(configPath, s.cfg, tap, rootfsCopy, subnet, vsockPath, guestCID); err != nil {
+	// Use stable, relative paths inside the per-sandbox jail dir.
+	if err := writeVMConfig(configPath, s.cfg, nc.TapName, "rootfs.ext4", subnet, "vsock.sock", uint32(1000+subnet)); err != nil {
 		return nil, fmt.Errorf("write vm config: %w", err)
 	}
 	socketPath := filepath.Join(sbDir, "firecracker.sock")
 	_ = os.Remove(socketPath)
+	_ = os.Remove(filepath.Join(sbDir, "vsock.sock"))
 
 	logPath := filepath.Join(sbDir, "firecracker.log")
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
@@ -513,7 +524,8 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		}
 	}
 
-	fcCmd := exec.Command(s.cfg.FirecrackerBin, "--api-sock", socketPath, "--config-file", configPath)
+	fcCmd := exec.Command("ip", "netns", "exec", nc.NetnsName, s.cfg.FirecrackerBin, "--api-sock", "firecracker.sock", "--config-file", "vm-config.json")
+	fcCmd.Dir = sbDir
 	fcCmd.Stdout = logFile
 	fcCmd.Stderr = logFile
 	// Start Firecracker in its own process group so cleanup can SIGKILL the group.
@@ -531,14 +543,13 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		}
 	}
 
+	vsockPath := filepath.Join(sbDir, "vsock.sock")
 	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
 	if err != nil {
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
-		_, _, _ = runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE")
-		natAdded = false
-		_, _, _ = runCmd("ip", "link", "del", tap)
-		cleanupTap = false
+		_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
+		cleanupNet = false
 		_ = logFile.Close()
 		return nil, fmt.Errorf("wait for agent: %w", err)
 	}
@@ -549,33 +560,32 @@ func (s *server) createSandbox(id string, subnet int) (*sandbox, error) {
 		Type: "net",
 		Net: &agentrpc.NetRequest{
 			Interface: "eth0",
-			Address:   guestIP + "/30",
-			Gateway:   hostIP,
+			Address:   nc.GuestIP + "/30",
+			Gateway:   nc.HostIP,
 			DNS:       "1.1.1.1",
 		},
 	}, 5*time.Second); err != nil {
 		_ = ac.Close()
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
-		_, _, _ = runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE")
-		natAdded = false
-		_, _, _ = runCmd("ip", "link", "del", tap)
-		cleanupTap = false
+		_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
+		cleanupNet = false
 		_ = logFile.Close()
 		return nil, fmt.Errorf("agent network config failed: %w", err)
 	}
 
 	_ = logFile.Close()
-	cleanupTap = false
-	natAdded = false
+	cleanupNet = false
+	cleanupDir = false
 
 	return &sandbox{
 		ID:         id,
 		Subnet:     subnet,
-		TapDevice:  tap,
-		HostIP:     hostIP,
-		GuestIP:    guestIP,
-		GuestCID:   guestCID,
+		TapDevice:  nc.TapName,
+		HostIP:     nc.HostIP,
+		GuestIP:    nc.GuestIP,
+		GuestCID:   uint32(1000 + subnet),
+		Netns:      nc,
 		Dir:        sbDir,
 		SocketPath: socketPath,
 		VsockPath:  vsockPath,
@@ -636,13 +646,8 @@ func (s *server) cleanupSandbox(sb *sandbox) error {
 		}
 	}
 
-	subnetCIDR := fmt.Sprintf("172.16.%d.0/30", sb.Subnet)
-	if _, _, err := runCmd("iptables", "-t", "nat", "-D", "POSTROUTING", "-s", subnetCIDR, "-o", s.cfg.HostNATIface, "-j", "MASQUERADE"); err != nil {
-		errs = append(errs, fmt.Sprintf("remove NAT rule: %v", err))
-	}
-
-	if _, _, err := runCmd("ip", "link", "del", sb.TapDevice); err != nil {
-		errs = append(errs, fmt.Sprintf("remove tap: %v", err))
+	if err := cleanupSandboxNetnsAndRouting(s.cfg, sb.Netns); err != nil {
+		errs = append(errs, fmt.Sprintf("cleanup netns: %v", err))
 	}
 
 	if err := os.RemoveAll(sb.Dir); err != nil {

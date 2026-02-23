@@ -31,6 +31,7 @@ At a high level, this is a single-host control plane plus one microVM per sandbo
 - **Per-sandbox writable disk:** cloned rootfs per VM
 - **Command transport:** vsock RPC to an in-guest agent (default); SSH is kept for debugging
 - **Network path:** per-sandbox host tap device + tiny `/30` subnet + host NAT (`iptables MASQUERADE`) for outbound internet access
+- **Host isolation:** each sandbox runs Firecracker in a per-sandbox network namespace (netns) so stable device names like `tap0` can be reused safely
 
 ### Architecture Diagram
 
@@ -40,7 +41,7 @@ graph TB
 
   subgraph Host["Host machine"]
     APIServer["Go API server\n(cmd/server)"]
-    Net["Host networking (tap + /30 + iptables NAT)"]
+    Net["Host networking (netns + tap + veth + iptables NAT)"]
     Artifacts["Guest artifacts (vmlinux + base rootfs.ext4)"]
     PerSandboxDisk["Per-sandbox rootfs clone (work dir)"]
     FC["Firecracker process (one per sandbox)"]
@@ -192,14 +193,18 @@ Trade-off:
 
 Per sandbox:
 
-- tap device (`tap-sb-*`)
+- network namespace (netns) which contains the sandbox tap and Firecracker process
+- tap device (`tap0` inside the sandbox netns)
+- veth pair connecting the sandbox netns to the root namespace (routing boundary)
 - private `/30` subnet (`172.16.X.0/30` pattern)
 - host IP (`.1`) and guest IP (`.2`)
 - NAT rule via iptables `MASQUERADE` on host egress interface
 
 What this means:
 
-- **tap device (per-sandbox):** a host-side virtual Ethernet interface created for a single microVM. Firecracker attaches the VM's virtual NIC to this tap, giving the host a direct L2 link used for guest egress traffic (and optional debug SSH access).
+- **netns (per-sandbox):** a Linux network namespace. Running Firecracker inside a per-sandbox netns allows each sandbox to reuse stable interface names (like `tap0`) without collisions.
+- **tap device (per-sandbox):** a host-side virtual Ethernet interface created for a single microVM. Firecracker attaches the VM's virtual NIC to this tap. The tap lives inside the sandbox netns.
+- **veth pair:** a linked pair of virtual Ethernet interfaces which connects the sandbox netns back to the root namespace so guest traffic can be routed and NATed out to the internet.
 - **`/30` subnet:** CIDR mask `255.255.255.252` (4 IPs total, 2 usable). Manta uses it like a point-to-point link:
   - subnet: `172.16.X.0/30`
   - host (tap) IP: `172.16.X.1`
