@@ -16,10 +16,18 @@
 - 50 samples
 - min: `144.394ms`, p50: `171.834ms`, p95: `190.617ms`, p99: `192.687ms`, max: `204.762ms`
 
-## Netns pool + netlink
+## Netns pool + netlink (v0.1.3)
 
 - With `MANTA_ENABLE_SNAPSHOTS=1`
 - With `MANTA_NETNS_POOL_SIZE=64` (default)
 - 50 samples
 - min: `63.899ms`, p50: `83.897ms`, p95: `105.149ms`, p99: `111.205ms`, max: `124.351ms`
+
+## Parallelized create setup
+
+- With `MANTA_ENABLE_SNAPSHOTS=1`
+- With default `MANTA_WORK_DIR=.manta-work`
+- With `MANTA_NETNS_POOL_SIZE=64` (default)
+- 50 samples
+- min: `60.321ms`, p50: `71.301ms`, p95: `78.160ms`, p99: `86.923ms`, max: `87.134ms`
 

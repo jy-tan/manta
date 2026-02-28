@@ -156,18 +156,41 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 		}
 	}()
 
-	// Clone the base disk into the sandbox jail directory so the restored VM has
-	// writable disk state but starts from the exact same bits the snapshot was
-	// taken with.
+	// Clone disk and acquire netns in parallel; these are independent setup
+	// steps and overlapping them shortens /create critical path.
 	rootfsCopy := filepath.Join(sbDir, "rootfs.ext4")
-	if _, _, err := runCmd("cp", "--reflink=auto", sp.BaseDisk, rootfsCopy); err != nil {
-		return nil, fmt.Errorf("clone snapshot base disk: %w", err)
-	}
+	cloneErrCh := make(chan error, 1)
+	netnsCh := make(chan struct {
+		nc  *netnsConfig
+		err error
+	}, 1)
+	go func() {
+		if _, _, err := runCmd("cp", "--reflink=auto", sp.BaseDisk, rootfsCopy); err != nil {
+			cloneErrCh <- fmt.Errorf("clone snapshot base disk: %w", err)
+			return
+		}
+		cloneErrCh <- nil
+	}()
+	go func() {
+		nc, err := s.acquireNetns(id)
+		netnsCh <- struct {
+			nc  *netnsConfig
+			err error
+		}{nc: nc, err: err}
+	}()
 
-	nc, err := s.acquireNetns(id)
-	if err != nil {
-		return nil, err
+	cloneErr := <-cloneErrCh
+	netnsRes := <-netnsCh
+	if cloneErr != nil || netnsRes.err != nil {
+		if netnsRes.nc != nil {
+			s.releaseNetns(netnsRes.nc)
+		}
+		if cloneErr != nil {
+			return nil, cloneErr
+		}
+		return nil, netnsRes.err
 	}
+	nc := netnsRes.nc
 	cleanupNet := true
 	defer func() {
 		if cleanupNet {

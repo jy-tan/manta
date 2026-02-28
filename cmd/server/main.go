@@ -244,7 +244,7 @@ func loadConfig() (config, error) {
 	// Firecracker is started with its working directory set to a per-sandbox
 	// jail dir. Resolve any relative artifact paths now so they remain valid
 	// regardless of cwd.
-	for _, p := range []*string{&cfg.KernelPath, &cfg.BaseRootfsPath, &cfg.SSHPrivateKey} {
+	for _, p := range []*string{&cfg.KernelPath, &cfg.BaseRootfsPath, &cfg.SSHPrivateKey, &cfg.WorkDir} {
 		abs, err := filepath.Abs(*p)
 		if err != nil {
 			return cfg, fmt.Errorf("resolve path %q: %w", *p, err)
@@ -517,21 +517,46 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 		}
 	}()
 
-	nc, err := s.acquireNetns(id)
-	if err != nil {
-		return nil, err
+	// Acquire netns and clone rootfs in parallel to reduce /create critical path.
+	rootfsCopy := filepath.Join(sbDir, "rootfs.ext4")
+	copyErrCh := make(chan error, 1)
+	netnsCh := make(chan struct {
+		nc  *netnsConfig
+		err error
+	}, 1)
+	go func() {
+		if _, _, err := runCmd("cp", "--reflink=auto", s.cfg.BaseRootfsPath, rootfsCopy); err != nil {
+			copyErrCh <- fmt.Errorf("copy rootfs: %w", err)
+			return
+		}
+		copyErrCh <- nil
+	}()
+	go func() {
+		nc, err := s.acquireNetns(id)
+		netnsCh <- struct {
+			nc  *netnsConfig
+			err error
+		}{nc: nc, err: err}
+	}()
+
+	copyErr := <-copyErrCh
+	netnsRes := <-netnsCh
+	if copyErr != nil || netnsRes.err != nil {
+		if netnsRes.nc != nil {
+			s.releaseNetns(netnsRes.nc)
+		}
+		if copyErr != nil {
+			return nil, copyErr
+		}
+		return nil, netnsRes.err
 	}
+	nc := netnsRes.nc
 	cleanupNet := true
 	defer func() {
 		if cleanupNet {
 			s.releaseNetns(nc)
 		}
 	}()
-
-	rootfsCopy := filepath.Join(sbDir, "rootfs.ext4")
-	if _, _, err := runCmd("cp", "--reflink=auto", s.cfg.BaseRootfsPath, rootfsCopy); err != nil {
-		return nil, fmt.Errorf("copy rootfs: %w", err)
-	}
 
 	configPath := filepath.Join(sbDir, "vm-config.json")
 	// Use stable, relative paths inside the per-sandbox jail dir.
