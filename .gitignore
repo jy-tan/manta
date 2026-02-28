@@ -22,6 +22,9 @@ server
 # Benchmark outputs
 /results/
 
+# Temp work dir
+/.manta-work/
+
 # OS/editor noise
 .DS_Store
 *~

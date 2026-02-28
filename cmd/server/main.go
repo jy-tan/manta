@@ -46,6 +46,10 @@ type config struct {
 	// golden snapshot". Snapshotting requires Firecracker snapshot support.
 	EnableSnapshots bool
 
+	// KeepFailedSandboxes keeps sandbox dirs/logs on create failure for easier
+	// debugging of Firecracker startup/snapshot issues.
+	KeepFailedSandboxes bool
+
 	// ExecTransport controls how /exec runs commands inside the guest.
 	// Supported: "agent" (vsock RPC), "ssh" (debug fallback).
 	ExecTransport string
@@ -209,11 +213,14 @@ func loadConfig() (config, error) {
 		BaseRootfsPath:  envOr("MANTA_ROOTFS_PATH", "./guest-artifacts/rootfs.ext4"),
 		SSHPrivateKey:   envOr("MANTA_SSH_KEY_PATH", "./guest-artifacts/sandbox_key"),
 		FirecrackerBin:  envOr("MANTA_FIRECRACKER_BIN", "firecracker"),
-		WorkDir:         envOr("MANTA_WORK_DIR", "/tmp/manta"),
+		// Dev default stays in-repo for reflink-friendly local benchmarking.
+		// Canonical production location is /var/lib/manta.
+		WorkDir:         envOr("MANTA_WORK_DIR", ".manta-work"),
 		CgroupRoot:      envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
 		EnableCgroups:   intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
 		NetnsPoolSize:   intOr("MANTA_NETNS_POOL_SIZE", 64),
 		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 0) != 0,
+		KeepFailedSandboxes: intOr("MANTA_DEBUG_KEEP_FAILED_SANDBOX", 0) != 0,
 		ExecTransport:   strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
 
 		AgentPort:        intOr("MANTA_AGENT_PORT", agentrpc.DefaultPort),

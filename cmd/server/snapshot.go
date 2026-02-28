@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -145,6 +148,10 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 	cleanupDir := true
 	defer func() {
 		if cleanupDir {
+			if s.cfg.KeepFailedSandboxes {
+				log.Printf("debug keep failed sandbox dir: %s", sbDir)
+				return
+			}
 			_ = os.RemoveAll(sbDir)
 		}
 	}()
@@ -199,6 +206,15 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
 
+	// Wait until Firecracker API socket is ready before hitting /snapshot/load.
+	// Without this, short races can fail fast with ENOENT/ECONNREFUSED.
+	if err := waitForUnixSocketReady(socketPath, 1500*time.Millisecond); err != nil {
+		_ = killProcessGroup(fcCmd)
+		_ = killCgroup(cgroupPath)
+		_ = logFile.Close()
+		return nil, fmt.Errorf("firecracker api socket not ready: %w", err)
+	}
+
 	// Best-effort: put process group in cgroup after spawn. (Children inherit.)
 	if cgroupPath != "" {
 		if err := movePidToCgroup(cgroupPath, fcCmd.Process.Pid); err != nil {
@@ -210,7 +226,7 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 
 	// Load snapshot and resume.
 	fc := newFCClient(socketPath, 10*time.Second)
-	if err := fc.loadSnapshot(sp.StateFile, sp.MemFile, true); err != nil {
+	if err := loadSnapshotWithRetry(fc, sp.StateFile, sp.MemFile, true, 1500*time.Millisecond); err != nil {
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
 		_ = logFile.Close()
@@ -265,4 +281,63 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 		Process:    fcCmd,
 		Agent:      ac,
 	}, nil
+}
+
+func waitForUnixSocketReady(socketPath string, timeout time.Duration) error {
+	if strings.TrimSpace(socketPath) == "" {
+		return fmt.Errorf("socket path is empty")
+	}
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(socketPath); err != nil {
+			lastErr = err
+		} else {
+			c, err := net.DialTimeout("unix", socketPath, 50*time.Millisecond)
+			if err == nil {
+				_ = c.Close()
+				return nil
+			}
+			lastErr = err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if lastErr != nil {
+		return fmt.Errorf("%q not ready after %s: %w", socketPath, timeout, lastErr)
+	}
+	return fmt.Errorf("%q not ready after %s", socketPath, timeout)
+}
+
+func loadSnapshotWithRetry(fc *fcClient, statePath, memPath string, resume bool, timeout time.Duration) error {
+	if timeout <= 0 {
+		timeout = 1500 * time.Millisecond
+	}
+
+	deadline := time.Now().Add(timeout)
+	for {
+		err := fc.loadSnapshot(statePath, memPath, resume)
+		if err == nil {
+			return nil
+		}
+		if !isTransientUnixSocketErr(err) || time.Now().After(deadline) {
+			return err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func isTransientUnixSocketErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOENT) || errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "connect: no such file or directory") ||
+		strings.Contains(msg, "connect: connection refused")
 }
