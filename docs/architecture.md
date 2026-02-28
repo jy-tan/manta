@@ -15,11 +15,15 @@ A sandbox must:
 
 ## Goal
 
-Manta provides a very small remote API for sandbox lifecycle:
+Manta provides a small remote API for sandbox lifecycle and user snapshots:
 
 - `POST /create` -> boot a sandbox VM and return `sandbox_id`
 - `POST /exec` -> run a command inside that VM
 - `POST /destroy` -> tear down VM and host resources
+- `POST /snapshot/create` -> capture a user snapshot from a running sandbox
+- `POST /snapshot/restore` -> create a new sandbox from a user snapshot
+- `GET /snapshot/list` -> list user snapshots
+- `POST /snapshot/delete` -> delete a user snapshot
 
 ## High-Level Architecture
 
@@ -28,7 +32,7 @@ At a high level, this is a single-host control plane plus one microVM per sandbo
 - **Control plane:** Go HTTP server in `cmd/server/main.go`
 - **Isolation runtime:** Firecracker process per sandbox
 - **Guest OS artifacts:** shared kernel + base rootfs image
-- **Per-sandbox writable disk:** cloned rootfs per VM
+- **Per-sandbox writable disk:** rootfs materialized per VM (clone strategy controlled by config)
 - **Command transport:** vsock RPC to an in-guest agent (default); SSH is kept for debugging
 - **Network path:** per-sandbox host tap device + tiny `/30` subnet + host NAT (`iptables MASQUERADE`) for outbound internet access
 - **Host isolation:** each sandbox runs Firecracker in a per-sandbox network namespace (netns) so stable device names like `tap0` can be reused safely
@@ -43,7 +47,8 @@ graph TB
     APIServer["Go API server\n(cmd/server)"]
     Net["Host networking (netns + tap + veth + iptables NAT)"]
     Artifacts["Guest artifacts (vmlinux + base rootfs.ext4)"]
-    PerSandboxDisk["Per-sandbox rootfs clone (work dir)"]
+    PerSandboxDisk["Per-sandbox rootfs materialization (work dir)"]
+    UserSnapshots["User snapshot store\n(state/mem/disk/meta)"]
     FC["Firecracker process (one per sandbox)"]
   end
 
@@ -60,11 +65,14 @@ graph TB
   APIServer -->|ip + iptables| Net
   APIServer -->|cp --reflink=auto| PerSandboxDisk
   APIServer -->|write vm-config.json| FC
+  APIServer -->|snapshot CRUD| UserSnapshots
   APIServer -->|vsock RPC| Agent
-  APIServer -.->|SSH (debug)| SSHD
+  APIServer -.->|"SSH (debug)"| SSHD
 
   Artifacts --> FC
   Artifacts --> PerSandboxDisk
+  UserSnapshots --> FC
+  UserSnapshots --> PerSandboxDisk
   Net <--> FC
   PerSandboxDisk --> FC
 
@@ -75,7 +83,7 @@ graph TB
   Agent --> Workload
 ```
 
-### Data Flow Diagram
+### Data Flow Diagram (Create/Exec/Destroy)
 
 ```mermaid
 sequenceDiagram
@@ -105,6 +113,31 @@ sequenceDiagram
   S-->>C: 200 {status:"ok"}
 ```
 
+### Data Flow Diagram (User Snapshot Create/Restore)
+
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant S as API server
+  participant F as Firecracker
+  participant G as Guest (manta-agent)
+  participant D as Snapshot store
+
+  C->>S: POST /snapshot/create {sandbox_id}
+  S->>F: Pause VM
+  S->>F: Create full snapshot (state + mem)
+  S->>D: Persist snapshot disk + meta.json
+  S->>F: Resume VM
+  S-->>C: 200 {snapshot_id}
+
+  C->>S: POST /snapshot/restore {snapshot_id}
+  S->>D: Load snapshot metadata
+  S->>S: Validate lineage compatibility
+  S->>F: Start Firecracker + load snapshot
+  S->>G: Wait agent ready + apply per-sandbox network
+  S-->>C: 200 {sandbox_id}
+```
+
 ### Request/Execution Path
 
 1. Client calls `POST /create`
@@ -120,6 +153,17 @@ sequenceDiagram
 11. Client calls `POST /destroy`
 12. Server kills VM process and cleans networking + files
 
+### User Snapshot Path
+
+1. Client calls `POST /snapshot/create` with `sandbox_id`
+2. Server pauses VM and asks Firecracker to create full snapshot files (`state.snap`, `mem.snap`)
+3. Server persists a snapshot disk image and writes snapshot metadata (`meta.json`)
+4. Server resumes VM and returns `snapshot_id`
+5. Client calls `POST /snapshot/restore` with `snapshot_id`
+6. Server loads metadata and validates snapshot lineage compatibility
+7. Server materializes per-sandbox writable disk from snapshot disk, starts Firecracker, and loads snapshot
+8. Server waits for agent readiness, applies per-sandbox guest network config, and returns new `sandbox_id`
+
 ## Key Components
 
 ### API Server (`cmd/server/main.go`)
@@ -129,11 +173,11 @@ This is the control plane and orchestration layer.
 Responsibilities:
 
 - Validates environment and prerequisites (`/dev/kvm`, artifacts, Firecracker binary)
-- Exposes HTTP API (`/create`, `/exec`, `/destroy`, `/healthz`)
+- Exposes HTTP APIs (`/create`, `/exec`, `/destroy`, `/snapshot/*`, `/healthz`)
 - Maintains in-memory sandbox map and IDs
 - Runs host commands for network setup and cleanup
 - Starts/stops Firecracker processes
-- Handles agent readiness (vsock ping) and command execution (vsock RPC)
+- Handles agent readiness (vsock ping), command execution (vsock RPC), and snapshot lifecycle metadata
 
 ### Firecracker Runtime
 
@@ -166,15 +210,30 @@ What it includes:
 - Base utilities + optional tooling (`python3`, `nodejs`, `npm`, etc.)
 - `iproute2` for runtime network configuration
 
-### Per-Sandbox Rootfs Clone
+### Per-Sandbox Rootfs Materialization
 
-On each create, Manta copies the base rootfs to a sandbox-specific file using:
+On each create/restore, Manta materializes a sandbox-specific writable disk from a source rootfs/snapshot disk:
 
-- `cp --reflink=auto ...`
+- `cp --reflink=auto ...` (default clone mode)
+- `cp --reflink=always ...` when `MANTA_ROOTFS_CLONE_MODE=reflink-required`
 
 Why required:
 
 - Each VM needs writable disk state isolated from other VMs.
+- Clone mode guardrail avoids silent full-copy fallback on non-reflink filesystems when strict mode is enabled.
+
+### Snapshot Stores and Lineage
+
+Manta currently uses two snapshot stores:
+
+- **Golden snapshot store** under `${MANTA_WORK_DIR}/snapshot` for fast `/create` baseline restores.
+- **User snapshot store** under `${MANTA_WORK_DIR}/user-snapshots/<snapshot_id>` containing:
+  - `state.snap`
+  - `mem.snap`
+  - `disk.ext4`
+  - `meta.json`
+
+Snapshot restore validates lineage metadata before restore to avoid loading snapshots against incompatible base/rootfs lineage.
 
 ### Agent Command Channel (vsock RPC)
 
@@ -219,3 +278,14 @@ Host vs guest configuration:
 Why required:
 
 - Guest workloads need outbound network access.
+
+## Benchmarks
+
+- Baseline create/exec benchmark history: `docs/benchmark-results.md`
+- User snapshot restore benchmark history: `docs/snapshot-benchmark-results.md`
+
+## Current Limitations
+
+- Snapshot storage is local to a single host/workdir (no cross-host mobility yet).
+- No multi-tenant authz model is enforced for snapshot APIs yet.
+- No quotas/retention policies for snapshot growth are enforced yet.

@@ -30,6 +30,8 @@ type config struct {
 	ListenAddr     string
 	KernelPath     string
 	BaseRootfsPath string
+	BaseRootfsLineageID string
+	RootfsCloneMode string
 	SSHPrivateKey  string
 	FirecrackerBin string
 	HostNATIface   string
@@ -94,6 +96,7 @@ type server struct {
 	cfg           config
 	mu            sync.Mutex
 	nextSandboxID uint64
+	nextSnapshotID uint64
 	nextSubnet    uint32
 	sandboxes     map[string]*sandbox
 	netnsPool     *netnsPool
@@ -172,6 +175,10 @@ func main() {
 	mux.HandleFunc("POST /create", srv.handleCreate)
 	mux.HandleFunc("POST /exec", srv.handleExec)
 	mux.HandleFunc("POST /destroy", srv.handleDestroy)
+	mux.HandleFunc("POST /snapshot/create", srv.handleSnapshotCreate)
+	mux.HandleFunc("POST /snapshot/restore", srv.handleSnapshotRestore)
+	mux.HandleFunc("GET /snapshot/list", srv.handleSnapshotList)
+	mux.HandleFunc("POST /snapshot/delete", srv.handleSnapshotDelete)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
@@ -211,6 +218,7 @@ func loadConfig() (config, error) {
 		ListenAddr:      envOr("MANTA_LISTEN_ADDR", ":8080"),
 		KernelPath:      envOr("MANTA_KERNEL_PATH", "./guest-artifacts/vmlinux"),
 		BaseRootfsPath:  envOr("MANTA_ROOTFS_PATH", "./guest-artifacts/rootfs.ext4"),
+		RootfsCloneMode: strings.ToLower(strings.TrimSpace(envOr("MANTA_ROOTFS_CLONE_MODE", "auto"))),
 		SSHPrivateKey:   envOr("MANTA_SSH_KEY_PATH", "./guest-artifacts/sandbox_key"),
 		FirecrackerBin:  envOr("MANTA_FIRECRACKER_BIN", "firecracker"),
 		// Dev default stays in-repo for reflink-friendly local benchmarking.
@@ -219,7 +227,7 @@ func loadConfig() (config, error) {
 		CgroupRoot:      envOr("MANTA_CGROUP_ROOT", "/sys/fs/cgroup/manta"),
 		EnableCgroups:   intOr("MANTA_ENABLE_CGROUPS", 1) != 0,
 		NetnsPoolSize:   intOr("MANTA_NETNS_POOL_SIZE", 64),
-		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 0) != 0,
+		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 1) != 0,
 		KeepFailedSandboxes: intOr("MANTA_DEBUG_KEEP_FAILED_SANDBOX", 0) != 0,
 		ExecTransport:   strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
 
@@ -250,6 +258,19 @@ func loadConfig() (config, error) {
 			return cfg, fmt.Errorf("resolve path %q: %w", *p, err)
 		}
 		*p = abs
+	}
+	if cfg.EnableSnapshots {
+		lineage, err := computeFileSHA256(cfg.BaseRootfsPath)
+		if err != nil {
+			return cfg, fmt.Errorf("compute base rootfs lineage: %w", err)
+		}
+		cfg.BaseRootfsLineageID = lineage
+	}
+	switch cfg.RootfsCloneMode {
+	case "auto", "reflink-required":
+		// ok
+	default:
+		return cfg, fmt.Errorf("invalid MANTA_ROOTFS_CLONE_MODE %q (expected auto or reflink-required)", cfg.RootfsCloneMode)
 	}
 
 	if cfg.HostNATIface = strings.TrimSpace(os.Getenv("MANTA_HOST_IFACE")); cfg.HostNATIface == "" {
@@ -525,7 +546,7 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 		err error
 	}, 1)
 	go func() {
-		if _, _, err := runCmd("cp", "--reflink=auto", s.cfg.BaseRootfsPath, rootfsCopy); err != nil {
+		if err := materializeSandboxRootfs(s.cfg, s.cfg.BaseRootfsPath, rootfsCopy); err != nil {
 			copyErrCh <- fmt.Errorf("copy rootfs: %w", err)
 			return
 		}

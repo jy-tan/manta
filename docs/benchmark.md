@@ -4,6 +4,11 @@ This document explains how to run Manta's benchmark harness and how to interpret
 
 The benchmark is designed to measure a single metric reliably: **TTI (Time to Interactive)** for a fresh sandbox.
 
+Manta now includes two benchmark binaries:
+
+- `cmd/bench`: baseline create-to-first-exec TTI
+- `cmd/bench_restore`: user-snapshot restore benchmarks (`restore_only` and `restore_tti`)
+
 ## What We Measure (TTI)
 
 **TTI** is the wall-clock time from:
@@ -49,6 +54,32 @@ Run the benchmark (Terminal 2):
 mkdir -p results
 go run ./cmd/bench --iterations 50 > results/stage1-naive.json
 ```
+
+## Running User Snapshot Restore Benchmarks
+
+Start the server with snapshots enabled (Terminal 1):
+
+```bash
+sudo env MANTA_ENABLE_SNAPSHOTS=1 go run ./cmd/server
+```
+
+Run restore benchmark (Terminal 2):
+
+```bash
+mkdir -p results
+go run ./cmd/bench_restore --iterations 50 > results/stage-restore-user-snapshot.json
+```
+
+This benchmark has two phases:
+
+1. Fixture setup (untimed): create sandbox, apply deterministic mutation, create user snapshot, destroy fixture sandbox.
+2. Measured loop: restore sandbox from snapshot, run sanity `/exec`, stop timer, destroy sandbox (untimed).
+
+It reports:
+
+- `restore_only_*`: latency for `POST /snapshot/restore` only
+- `restore_tti_*`: latency from restore request start to successful first sanity exec response
+- failure classes (`restore_api`, `sanity_exec`, `destroy`, `other`)
 
 ## Benchmark Flags
 
@@ -99,6 +130,12 @@ The JSON output is a single object, with durations reported in nanoseconds:
 
 The textual output prints the same percentiles as durations.
 
+For `cmd/bench_restore`, output includes:
+
+- `restore_only_min_ns`, `restore_only_p50_ns`, `restore_only_p95_ns`, `restore_only_p99_ns`, `restore_only_max_ns`
+- `restore_tti_min_ns`, `restore_tti_p50_ns`, `restore_tti_p95_ns`, `restore_tti_p99_ns`, `restore_tti_max_ns`
+- `failures` object with per-class failure counts
+
 ## Tips for Stable Measurements
 
 If you care about comparing runs over time, try to keep these stable:
@@ -116,6 +153,7 @@ Recommended result naming:
 
 - `results/stage1-naive.json` for the baseline
 - `results/stage2-<name>.json` and so on as we go.
+- `results/stage-restore-user-snapshot.json` for user-snapshot restore runs
 
 When you publish results, ideally include:
 
@@ -123,4 +161,9 @@ When you publish results, ideally include:
 - kernel version (host)
 - Firecracker version
 - Manta config knobs (e.g. VM mem/vcpu, cgroup enabled, host iface)
+
+See:
+
+- `docs/benchmark-results.md` for baseline create/exec benchmark history
+- `docs/snapshot-benchmark-results.md` for user snapshot restore benchmark history
 

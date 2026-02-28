@@ -1,8 +1,12 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -24,6 +28,13 @@ type snapshotPaths struct {
 	MetaFile  string
 }
 
+type snapshotMeta struct {
+	Version        int    `json:"version"`
+	LineageID      string `json:"lineage_id"`
+	BaseRootfsPath string `json:"base_rootfs_path"`
+	CreatedAt      string `json:"created_at"`
+}
+
 func snapshotLayout(workDir string) snapshotPaths {
 	dir := filepath.Join(workDir, "snapshot")
 	base := filepath.Join(dir, "base")
@@ -40,9 +51,17 @@ func snapshotLayout(workDir string) snapshotPaths {
 func ensureSnapshot(cfg config) (snapshotPaths, error) {
 	sp := snapshotLayout(cfg.WorkDir)
 
-	// If snapshot files exist, assume valid.
+	// If snapshot files exist, validate lineage metadata to ensure restore
+	// compatibility with the currently configured base rootfs.
 	if fileExists(sp.StateFile) && fileExists(sp.MemFile) && fileExists(sp.BaseDisk) {
-		return sp, nil
+		if err := validateSnapshotMeta(sp, cfg); err == nil {
+			return sp, nil
+		} else {
+			log.Printf("snapshot metadata mismatch; rebuilding snapshot: %v", err)
+		}
+		if err := resetSnapshotDir(sp); err != nil {
+			return sp, err
+		}
 	}
 
 	if err := os.MkdirAll(sp.BaseDir, 0o755); err != nil {
@@ -51,7 +70,7 @@ func ensureSnapshot(cfg config) (snapshotPaths, error) {
 
 	// Prepare base disk which will be used for the snapshot and for per-sandbox
 	// reflink clones. This disk must remain immutable after snapshot creation.
-	if _, _, err := runCmd("cp", "--reflink=auto", cfg.BaseRootfsPath, sp.BaseDisk); err != nil {
+	if err := materializeSandboxRootfs(cfg, cfg.BaseRootfsPath, sp.BaseDisk); err != nil {
 		return sp, fmt.Errorf("copy base disk for snapshot: %w", err)
 	}
 
@@ -126,6 +145,10 @@ func ensureSnapshot(cfg config) (snapshotPaths, error) {
 	_ = killProcessGroup(fcCmd)
 	_, _ = fcCmd.Process.Wait()
 
+	if err := writeSnapshotMeta(sp, cfg); err != nil {
+		return sp, err
+	}
+
 	log.Printf("snapshot ready: state=%s mem=%s base_disk=%s", sp.StateFile, sp.MemFile, sp.BaseDisk)
 	return sp, nil
 }
@@ -165,7 +188,7 @@ func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
 		err error
 	}, 1)
 	go func() {
-		if _, _, err := runCmd("cp", "--reflink=auto", sp.BaseDisk, rootfsCopy); err != nil {
+		if err := materializeSandboxRootfs(s.cfg, sp.BaseDisk, rootfsCopy); err != nil {
 			cloneErrCh <- fmt.Errorf("clone snapshot base disk: %w", err)
 			return
 		}
@@ -363,4 +386,86 @@ func isTransientUnixSocketErr(err error) bool {
 	msg := strings.ToLower(err.Error())
 	return strings.Contains(msg, "connect: no such file or directory") ||
 		strings.Contains(msg, "connect: connection refused")
+}
+
+func materializeSandboxRootfs(cfg config, srcPath, dstPath string) error {
+	reflinkMode := "--reflink=auto"
+	if cfg.RootfsCloneMode == "reflink-required" {
+		reflinkMode = "--reflink=always"
+	}
+	_, _, err := runCmd("cp", reflinkMode, srcPath, dstPath)
+	if err != nil && cfg.RootfsCloneMode == "reflink-required" {
+		return fmt.Errorf("%w; reflink-required mode prevents full-copy fallback", err)
+	}
+	return err
+}
+
+func validateSnapshotMeta(sp snapshotPaths, cfg config) error {
+	raw, err := os.ReadFile(sp.MetaFile)
+	if err != nil {
+		return fmt.Errorf("read snapshot meta: %w", err)
+	}
+	var meta snapshotMeta
+	if err := json.Unmarshal(raw, &meta); err != nil {
+		return fmt.Errorf("decode snapshot meta: %w", err)
+	}
+	if meta.Version != 1 {
+		return fmt.Errorf("unsupported snapshot meta version %d", meta.Version)
+	}
+	if strings.TrimSpace(cfg.BaseRootfsLineageID) == "" {
+		return nil
+	}
+	if strings.TrimSpace(meta.LineageID) == "" {
+		return fmt.Errorf("snapshot meta missing lineage id")
+	}
+	if meta.LineageID != cfg.BaseRootfsLineageID {
+		return fmt.Errorf("snapshot lineage mismatch (meta=%s current=%s)", meta.LineageID, cfg.BaseRootfsLineageID)
+	}
+	return nil
+}
+
+func writeSnapshotMeta(sp snapshotPaths, cfg config) error {
+	meta := snapshotMeta{
+		Version:        1,
+		LineageID:      cfg.BaseRootfsLineageID,
+		BaseRootfsPath: cfg.BaseRootfsPath,
+		CreatedAt:      time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	raw, err := json.MarshalIndent(meta, "", "  ")
+	if err != nil {
+		return fmt.Errorf("encode snapshot meta: %w", err)
+	}
+	raw = append(raw, '\n')
+	tmp := sp.MetaFile + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return fmt.Errorf("write snapshot meta: %w", err)
+	}
+	if err := os.Rename(tmp, sp.MetaFile); err != nil {
+		return fmt.Errorf("persist snapshot meta: %w", err)
+	}
+	return nil
+}
+
+func resetSnapshotDir(sp snapshotPaths) error {
+	if err := os.RemoveAll(sp.Dir); err != nil {
+		return fmt.Errorf("remove old snapshot dir: %w", err)
+	}
+	if err := os.MkdirAll(sp.BaseDir, 0o755); err != nil {
+		return fmt.Errorf("recreate snapshot dir: %w", err)
+	}
+	return nil
+}
+
+func computeFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open file for sha256 %q: %w", path, err)
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", fmt.Errorf("hash file %q: %w", path, err)
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
 }

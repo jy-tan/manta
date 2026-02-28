@@ -31,3 +31,11 @@
 - 50 samples
 - min: `60.321ms`, p50: `71.301ms`, p95: `78.160ms`, p99: `86.923ms`, max: `87.134ms`
 
+## Clone-mode guardrail check
+
+- With `MANTA_ENABLE_SNAPSHOTS=1`
+- With `MANTA_ROOTFS_CLONE_MODE=auto` (default behavior)
+- 50 samples
+- min: `61.809ms`, p50: `75.033ms`, p95: `81.306ms`, p99: `83.919ms`, max: `84.606ms`
+- Note: this change is primarily a correctness/scalability guardrail (optional fail-fast on non-reflink filesystems), so no major p50 gain is expected when reflink already succeeds.
+
