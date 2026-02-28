@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mdlayher/vsock"
+	"github.com/vishvananda/netlink"
 
 	"manta/internal/agentrpc"
 )
@@ -227,18 +228,42 @@ func configureNetwork(req agentrpc.NetRequest) error {
 	if addr == "" || gw == "" {
 		return fmt.Errorf("address and gateway are required")
 	}
+	gateway := net.ParseIP(gw)
+	if gateway == nil {
+		return fmt.Errorf("invalid gateway ip %q", gw)
+	}
 
+	link, err := netlink.LinkByName(iface)
+	if err != nil {
+		return fmt.Errorf("lookup interface %q: %w", iface, err)
+	}
 	// Bring link up and overwrite any prior config from the base image.
-	if _, err := run("ip", "link", "set", "dev", iface, "up"); err != nil {
-		return err
+	if err := netlink.LinkSetUp(link); err != nil {
+		return fmt.Errorf("set interface %q up: %w", iface, err)
 	}
-	_, _ = run("ip", "addr", "flush", "dev", iface)
+	addrs, err := netlink.AddrList(link, netlink.FAMILY_V4)
+	if err != nil {
+		return fmt.Errorf("list addresses on %q: %w", iface, err)
+	}
+	for _, existing := range addrs {
+		if err := netlink.AddrDel(link, &existing); err != nil {
+			return fmt.Errorf("remove address %q on %q: %w", existing.String(), iface, err)
+		}
+	}
 
-	if _, err := run("ip", "addr", "add", addr, "dev", iface); err != nil {
-		return err
+	parsedAddr, err := netlink.ParseAddr(addr)
+	if err != nil {
+		return fmt.Errorf("parse interface address %q: %w", addr, err)
 	}
-	if _, err := run("ip", "route", "replace", "default", "via", gw, "dev", iface); err != nil {
-		return err
+	if err := netlink.AddrAdd(link, parsedAddr); err != nil {
+		return fmt.Errorf("assign address %q to %q: %w", addr, iface, err)
+	}
+	if err := netlink.RouteReplace(&netlink.Route{
+		LinkIndex: link.Attrs().Index,
+		Dst:       nil, // default route
+		Gw:        gateway,
+	}); err != nil {
+		return fmt.Errorf("set default route via %q dev %q: %w", gw, iface, err)
 	}
 
 	if dns := strings.TrimSpace(req.DNS); dns != "" {
@@ -246,24 +271,6 @@ func configureNetwork(req agentrpc.NetRequest) error {
 	}
 
 	return nil
-}
-
-func run(name string, args ...string) (string, error) {
-	cmd := exec.Command(name, args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" {
-			msg = strings.TrimSpace(stdout.String())
-		}
-		if msg != "" {
-			return stdout.String(), fmt.Errorf("%s %v: %w (%s)", name, args, err, msg)
-		}
-		return stdout.String(), fmt.Errorf("%s %v: %w", name, args, err)
-	}
-	return stdout.String(), nil
 }
 
 func errString(err error) string {

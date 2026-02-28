@@ -39,10 +39,17 @@
 - min: `61.809ms`, p50: `75.033ms`, p95: `81.306ms`, p99: `83.919ms`, max: `84.606ms`
 - Note: this change is primarily a correctness/scalability guardrail (optional fail-fast on non-reflink filesystems), so no major p50 gain is expected when reflink already succeeds.
 
-## Polling interval tuning
+## Polling interval tuning (v0.1.4)
 
 - With snapshots enabled (`MANTA_ENABLE_SNAPSHOTS=1`)
 - With reduced readiness poll sleeps (socket: `20ms` -> `2ms`, agent: `50ms` -> `10ms`)
 - 50 samples
 - min: `48.767ms`, p50: `66.405ms`, p95: `74.683ms`, p99: `75.777ms`, max: `76.745ms`
+
+## In-guest net config via netlink
+
+- With snapshots enabled (`MANTA_ENABLE_SNAPSHOTS=1`)
+- With rebuilt rootfs/snapshot including updated `manta-agent` network config path
+- 50 samples
+- min: `43.839ms`, p50: `51.424ms`, p95: `59.030ms`, p99: `60.765ms`, max: `61.623ms`
 

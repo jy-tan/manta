@@ -100,7 +100,7 @@ sequenceDiagram
   S->>H: Write Firecracker config JSON
   S->>F: Start Firecracker process
   S->>G: Wait for agent readiness (vsock ping)
-  S->>G: Configure guest network (ip addr/route + DNS)
+  S->>G: Configure guest network (netlink addr/route + DNS)
   S-->>C: 200 {sandbox_id}
 
   C->>S: POST /exec {sandbox_id, cmd}
@@ -273,7 +273,7 @@ What this means:
 Host vs guest configuration:
 
 - **On the host:** create the tap, assign the host IP, enable IPv4 forwarding, and add/remove the NAT rule.
-- **In the guest (microVM):** the network interface still needs configuration (IP address, netmask, default gateway, DNS). Manta configures this post-boot via vsock RPC by running `ip addr/route` commands in the guest through the agent.
+- **In the guest (microVM):** the network interface still needs configuration (IP address, netmask, default gateway, DNS). Manta configures this post-boot via vsock RPC; the in-guest agent applies interface/address/route changes via netlink and can update `/etc/resolv.conf`.
 
 Why required:
 
