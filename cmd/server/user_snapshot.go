@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -159,6 +160,15 @@ func (s *server) createUserSnapshotFromSandbox(sb *sandbox, snapshotID, name str
 	if sb == nil {
 		return userSnapshotMeta{}, fmt.Errorf("sandbox is nil")
 	}
+	// Avoid snapshotting an active host<->guest agent stream. A stale captured
+	// vsock session can delay agent re-readiness after restore.
+	sb.agentMu.Lock()
+	if sb.Agent != nil {
+		_ = sb.Agent.Close()
+		sb.Agent = nil
+	}
+	sb.agentMu.Unlock()
+
 	rootDir := userSnapshotRootDir(s.cfg.WorkDir, snapshotID)
 	if err := os.MkdirAll(rootDir, 0o755); err != nil {
 		return userSnapshotMeta{}, fmt.Errorf("create snapshot dir: %w", err)
@@ -211,6 +221,7 @@ func (s *server) createUserSnapshotFromSandbox(sb *sandbox, snapshotID, name str
 }
 
 func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta) (*sandbox, error) {
+	restoreStart := time.Now()
 	for _, p := range []string{meta.StateFile, meta.MemFile, meta.DiskFile} {
 		if !fileExists(p) {
 			return nil, fmt.Errorf("snapshot artifact missing: %s", p)
@@ -229,34 +240,48 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 	}()
 
 	rootfsCopy := filepath.Join(sbDir, "rootfs.ext4")
-	cloneErrCh := make(chan error, 1)
+	cloneCh := make(chan struct {
+		err error
+		dur time.Duration
+	}, 1)
 	netnsCh := make(chan struct {
 		nc  *netnsConfig
 		err error
+		dur time.Duration
 	}, 1)
 	go func() {
+		start := time.Now()
 		if err := materializeSandboxRootfs(s.cfg, meta.DiskFile, rootfsCopy); err != nil {
-			cloneErrCh <- fmt.Errorf("clone user snapshot disk: %w", err)
+			cloneCh <- struct {
+				err error
+				dur time.Duration
+			}{err: fmt.Errorf("clone user snapshot disk: %w", err), dur: time.Since(start)}
 			return
 		}
-		cloneErrCh <- nil
+		cloneCh <- struct {
+			err error
+			dur time.Duration
+		}{err: nil, dur: time.Since(start)}
 	}()
 	go func() {
+		start := time.Now()
 		nc, err := s.acquireNetns(id)
 		netnsCh <- struct {
 			nc  *netnsConfig
 			err error
-		}{nc: nc, err: err}
+			dur time.Duration
+		}{nc: nc, err: err, dur: time.Since(start)}
 	}()
 
-	cloneErr := <-cloneErrCh
+	cloneRes := <-cloneCh
 	netnsRes := <-netnsCh
-	if cloneErr != nil || netnsRes.err != nil {
+	prepOverlapDur := time.Since(restoreStart)
+	if cloneRes.err != nil || netnsRes.err != nil {
 		if netnsRes.nc != nil {
 			s.releaseNetns(netnsRes.nc)
 		}
-		if cloneErr != nil {
-			return nil, cloneErr
+		if cloneRes.err != nil {
+			return nil, cloneRes.err
 		}
 		return nil, netnsRes.err
 	}
@@ -295,12 +320,14 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 		_ = logFile.Close()
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
+	socketWaitStart := time.Now()
 	if err := waitForUnixSocketReady(socketPath, 1500*time.Millisecond); err != nil {
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
 		_ = logFile.Close()
 		return nil, fmt.Errorf("firecracker api socket not ready: %w", err)
 	}
+	socketReadyDur := time.Since(socketWaitStart)
 	if cgroupPath != "" {
 		if err := movePidToCgroup(cgroupPath, fcCmd.Process.Pid); err != nil {
 			_ = os.Remove(cgroupPath)
@@ -309,14 +336,17 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 	}
 
 	fc := newFCClient(socketPath, 10*time.Second)
+	loadStart := time.Now()
 	if err := loadSnapshotWithRetry(fc, meta.StateFile, meta.MemFile, true, 1500*time.Millisecond); err != nil {
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
 		_ = logFile.Close()
 		return nil, fmt.Errorf("load snapshot: %w", err)
 	}
+	loadDur := time.Since(loadStart)
 
 	vsockPath := filepath.Join(sbDir, "vsock.sock")
+	agentWaitStart := time.Now()
 	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
 	if err != nil {
 		_ = killProcessGroup(fcCmd)
@@ -324,6 +354,8 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 		_ = logFile.Close()
 		return nil, fmt.Errorf("wait for agent after snapshot: %w", err)
 	}
+	agentReadyDur := time.Since(agentWaitStart)
+	guestNetStart := time.Now()
 	if _, err := ac.Call(agentrpc.Request{
 		Type: "net",
 		Net: &agentrpc.NetRequest{
@@ -339,10 +371,15 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 		_ = logFile.Close()
 		return nil, fmt.Errorf("agent network config failed: %w", err)
 	}
+	guestNetDur := time.Since(guestNetStart)
 
 	_ = logFile.Close()
 	cleanupNet = false
 	cleanupDir = false
+	totalDur := time.Since(restoreStart)
+	if s.cfg.EnableStageTimingLogs {
+		log.Printf("snapshot restore timing: snapshot_id=%s sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", meta.SnapshotID, id, cloneRes.dur, netnsRes.dur, prepOverlapDur, socketReadyDur, loadDur, agentReadyDur, guestNetDur, totalDur)
+	}
 	return &sandbox{
 		ID:         id,
 		Subnet:     nc.Subnet,

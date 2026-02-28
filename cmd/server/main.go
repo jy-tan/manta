@@ -51,6 +51,7 @@ type config struct {
 	// KeepFailedSandboxes keeps sandbox dirs/logs on create failure for easier
 	// debugging of Firecracker startup/snapshot issues.
 	KeepFailedSandboxes bool
+	EnableStageTimingLogs bool
 
 	// ExecTransport controls how /exec runs commands inside the guest.
 	// Supported: "agent" (vsock RPC), "ssh" (debug fallback).
@@ -152,6 +153,7 @@ func main() {
 	if err := ensurePreflight(cfg); err != nil {
 		log.Fatalf("preflight failed: %v", err)
 	}
+	logStartupDiagnostics(cfg)
 
 	srv := &server{
 		cfg:       cfg,
@@ -229,6 +231,7 @@ func loadConfig() (config, error) {
 		NetnsPoolSize:   intOr("MANTA_NETNS_POOL_SIZE", 64),
 		EnableSnapshots: intOr("MANTA_ENABLE_SNAPSHOTS", 1) != 0,
 		KeepFailedSandboxes: intOr("MANTA_DEBUG_KEEP_FAILED_SANDBOX", 0) != 0,
+		EnableStageTimingLogs: intOr("MANTA_ENABLE_STAGE_TIMINGS", 0) != 0,
 		ExecTransport:   strings.ToLower(strings.TrimSpace(envOr("MANTA_EXEC_TRANSPORT", "agent"))),
 
 		AgentPort:        intOr("MANTA_AGENT_PORT", agentrpc.DefaultPort),
@@ -1115,4 +1118,40 @@ func durationOr(name string, fallback time.Duration) time.Duration {
 		}
 	}
 	return fallback
+}
+
+func logStartupDiagnostics(cfg config) {
+	reflinkOK, reflinkErr := probeReflinkSupport(cfg.WorkDir)
+	log.Printf("startup diagnostics:")
+	log.Printf("- runtime: listen_addr=%s host_iface=%s work_dir=%s", cfg.ListenAddr, cfg.HostNATIface, cfg.WorkDir)
+	log.Printf("- features: snapshots_enabled=%t netns_pool_size=%d cgroups_enabled=%t", cfg.EnableSnapshots, cfg.NetnsPoolSize, cfg.EnableCgroups)
+	log.Printf("- storage: rootfs_clone_mode=%s", cfg.RootfsCloneMode)
+	log.Printf("- diagnostics: stage_timing_logs=%t", cfg.EnableStageTimingLogs)
+	if reflinkErr != nil {
+		log.Printf("- storage: reflink_probe_error=%v", reflinkErr)
+		return
+	}
+	log.Printf("- storage: reflink_supported=%t", reflinkOK)
+	if cfg.EnableSnapshots && !reflinkOK {
+		log.Printf("- warning: reflink probe failed for work dir; snapshot disk materialization may fall back to full copy unless MANTA_ROOTFS_CLONE_MODE=reflink-required")
+	}
+}
+
+func probeReflinkSupport(workDir string) (bool, error) {
+	probeDir := filepath.Join(workDir, ".reflink-probe")
+	if err := os.MkdirAll(probeDir, 0o755); err != nil {
+		return false, fmt.Errorf("create probe dir: %w", err)
+	}
+	defer os.RemoveAll(probeDir)
+
+	src := filepath.Join(probeDir, "src")
+	dst := filepath.Join(probeDir, "dst")
+	if err := os.WriteFile(src, []byte("probe\n"), 0o644); err != nil {
+		return false, fmt.Errorf("write probe src: %w", err)
+	}
+	_, _, err := runCmd("cp", "--reflink=always", src, dst)
+	if err != nil {
+		return false, nil
+	}
+	return true, nil
 }

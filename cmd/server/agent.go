@@ -107,7 +107,7 @@ func waitForAgentReady(udsPath string, port int, timeout, dialTimeout time.Durat
 		} else {
 			lastErr = err
 		}
-		time.Sleep(50 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	if lastErr != nil {
 		return nil, fmt.Errorf("agent not ready after %s: %w", timeout, lastErr)
