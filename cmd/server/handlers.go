@@ -12,6 +12,8 @@ import (
 	"manta/internal/agentrpc"
 )
 
+const destroyExecDrainTimeout = 2 * time.Second
+
 func (s *server) handleCreate(w http.ResponseWriter, _ *http.Request) {
 	id := fmt.Sprintf("sb-%d", atomic.AddUint64(&s.nextSandboxID, 1))
 	sb, err := s.createSandbox(id)
@@ -48,6 +50,11 @@ func (s *server) handleExec(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sandbox not found"})
 		return
 	}
+	if err := sb.tryStartExec(); err != nil {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error()})
+		return
+	}
+	defer sb.finishExec()
 
 	timeout := s.cfg.ExecTimeout
 	if req.TimeoutMs > 0 {
@@ -194,6 +201,14 @@ func (s *server) handleDestroy(w http.ResponseWriter, r *http.Request) {
 	if sb == nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "sandbox not found"})
 		return
+	}
+	if !sb.beginDestroy() {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "sandbox is closing"})
+		return
+	}
+	defer sb.finishDestroy()
+	if !sb.waitForExecDrain(destroyExecDrainTimeout) {
+		log.Printf("destroy %s proceeding with %d in-flight exec(s) after %s drain timeout", sb.ID, sb.currentInFlightExec(), destroyExecDrainTimeout)
 	}
 
 	if err := s.cleanupSandbox(sb); err != nil {

@@ -8,8 +8,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
-
-	"manta/internal/agentrpc"
 )
 
 type restoreTimings struct {
@@ -109,25 +107,13 @@ func (s *server) restoreSandboxFromArtifacts(
 	}()
 
 	// Start Firecracker with API socket only; restore from snapshot via API.
-	socketPath := filepath.Join(sbDir, "firecracker.sock")
-	_ = os.Remove(socketPath)
-	_ = os.Remove(filepath.Join(sbDir, "vsock.sock"))
-
-	logPath := filepath.Join(sbDir, "firecracker.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	socketPath, vsockPath, logPath := prepareSandboxRuntimePaths(sbDir)
+	logFile, err := openSandboxLog(logPath)
 	if err != nil {
-		return nil, timings, fmt.Errorf("open firecracker log file: %w", err)
+		return nil, timings, err
 	}
 
-	var cgroupPath string
-	if s.cfg.EnableCgroups {
-		cg := filepath.Join(s.cfg.CgroupRoot, id)
-		if err := os.Mkdir(cg, 0o755); err == nil {
-			cgroupPath = cg
-		} else if logCgroupErrors {
-			log.Printf("create cgroup %q failed, continuing without cgroups: %v", cg, err)
-		}
-	}
+	cgroupPath := s.prepareSandboxCgroup(id, logCgroupErrors)
 
 	fcCmd := exec.Command("ip", "netns", "exec", nc.NetnsName, s.cfg.FirecrackerBin, "--api-sock", "firecracker.sock")
 	fcCmd.Dir = sbDir
@@ -150,16 +136,7 @@ func (s *server) restoreSandboxFromArtifacts(
 	}
 	timings.SocketReady = time.Since(socketWaitStart)
 
-	// Best-effort: put process group in cgroup after spawn. (Children inherit.)
-	if cgroupPath != "" {
-		if err := movePidToCgroup(cgroupPath, fcCmd.Process.Pid); err != nil {
-			if logCgroupErrors {
-				log.Printf("move firecracker pid to cgroup failed (pid=%d cgroup=%q): %v", fcCmd.Process.Pid, cgroupPath, err)
-			}
-			_ = os.Remove(cgroupPath)
-			cgroupPath = ""
-		}
-	}
+	cgroupPath = s.attachSandboxProcessToCgroup(cgroupPath, fcCmd.Process.Pid, logCgroupErrors)
 
 	// Load snapshot and resume.
 	fc := newFCClient(socketPath, 10*time.Second)
@@ -173,7 +150,6 @@ func (s *server) restoreSandboxFromArtifacts(
 	timings.SnapshotLoad = time.Since(loadStart)
 
 	// Wait for the agent to accept new connections after resume.
-	vsockPath := filepath.Join(sbDir, "vsock.sock")
 	agentWaitStart := time.Now()
 	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
 	if err != nil {
@@ -186,20 +162,12 @@ func (s *server) restoreSandboxFromArtifacts(
 
 	// Apply per-sandbox guest IP config post-restore.
 	guestNetStart := time.Now()
-	if _, err := ac.Call(agentrpc.Request{
-		Type: "net",
-		Net: &agentrpc.NetRequest{
-			Interface: "eth0",
-			Address:   nc.GuestIP + "/30",
-			Gateway:   nc.HostIP,
-			DNS:       "1.1.1.1",
-		},
-	}, 5*time.Second); err != nil {
+	if err := s.configureSandboxGuestNetwork(ac, nc); err != nil {
 		_ = ac.Close()
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
 		_ = logFile.Close()
-		return nil, timings, fmt.Errorf("agent network config failed: %w", err)
+		return nil, timings, err
 	}
 	timings.GuestNet = time.Since(guestNetStart)
 
@@ -224,5 +192,57 @@ func (s *server) restoreSandboxFromArtifacts(
 		CgroupPath: cgroupPath,
 		Process:    fcCmd,
 		Agent:      ac,
+		state:      sandboxStateRunning,
 	}, timings, nil
+}
+
+func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
+	createStart := time.Now()
+	sp, err := ensureSnapshot(s.cfg)
+	if err != nil {
+		return nil, err
+	}
+	sb, timings, err := s.restoreSandboxFromArtifacts(
+		id,
+		createStart,
+		sp.BaseDisk,
+		sp.StateFile,
+		sp.MemFile,
+		"clone snapshot base disk",
+		s.cfg.KeepFailedSandboxes,
+		true,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if s.cfg.EnableStageTimingLogs {
+		log.Printf("create snapshot timing: sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", id, timings.DiskMaterialize, timings.NetnsAcquire, timings.PrepOverlap, timings.SocketReady, timings.SnapshotLoad, timings.AgentReady, timings.GuestNet, timings.Total)
+	}
+	return sb, nil
+}
+
+func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta) (*sandbox, error) {
+	restoreStart := time.Now()
+	for _, p := range []string{meta.StateFile, meta.MemFile, meta.DiskFile} {
+		if !fileExists(p) {
+			return nil, fmt.Errorf("snapshot artifact missing: %s", p)
+		}
+	}
+	sb, timings, err := s.restoreSandboxFromArtifacts(
+		id,
+		restoreStart,
+		meta.DiskFile,
+		meta.StateFile,
+		meta.MemFile,
+		"clone user snapshot disk",
+		false,
+		false,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if s.cfg.EnableStageTimingLogs {
+		log.Printf("snapshot restore timing: snapshot_id=%s sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", meta.SnapshotID, id, timings.DiskMaterialize, timings.NetnsAcquire, timings.PrepOverlap, timings.SocketReady, timings.SnapshotLoad, timings.AgentReady, timings.GuestNet, timings.Total)
+	}
+	return sb, nil
 }

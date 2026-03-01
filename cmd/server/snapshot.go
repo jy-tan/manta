@@ -156,31 +156,6 @@ func fileExists(p string) bool {
 	return err == nil
 }
 
-func (s *server) createSandboxFromSnapshot(id string) (*sandbox, error) {
-	createStart := time.Now()
-	sp, err := ensureSnapshot(s.cfg)
-	if err != nil {
-		return nil, err
-	}
-	sb, timings, err := s.restoreSandboxFromArtifacts(
-		id,
-		createStart,
-		sp.BaseDisk,
-		sp.StateFile,
-		sp.MemFile,
-		"clone snapshot base disk",
-		s.cfg.KeepFailedSandboxes,
-		true,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if s.cfg.EnableStageTimingLogs {
-		log.Printf("create snapshot timing: sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", id, timings.DiskMaterialize, timings.NetnsAcquire, timings.PrepOverlap, timings.SocketReady, timings.SnapshotLoad, timings.AgentReady, timings.GuestNet, timings.Total)
-	}
-	return sb, nil
-}
-
 func waitForUnixSocketReady(socketPath string, timeout time.Duration) error {
 	if strings.TrimSpace(socketPath) == "" {
 		return fmt.Errorf("socket path is empty")

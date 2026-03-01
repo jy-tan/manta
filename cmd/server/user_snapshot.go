@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -107,9 +106,17 @@ func (s *server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}
-	if strings.TrimSpace(s.cfg.BaseRootfsLineageID) != "" && strings.TrimSpace(meta.LineageID) != "" && meta.LineageID != s.cfg.BaseRootfsLineageID {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": fmt.Sprintf("snapshot lineage mismatch (snapshot=%s current=%s)", meta.LineageID, s.cfg.BaseRootfsLineageID)})
-		return
+	currentLineage := strings.TrimSpace(s.cfg.BaseRootfsLineageID)
+	metaLineage := strings.TrimSpace(meta.LineageID)
+	if currentLineage != "" {
+		if metaLineage == "" {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "snapshot meta missing lineage id"})
+			return
+		}
+		if metaLineage != currentLineage {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": fmt.Sprintf("snapshot lineage mismatch (snapshot=%s current=%s)", metaLineage, currentLineage)})
+			return
+		}
 	}
 
 	id := fmt.Sprintf("sb-%d", atomic.AddUint64(&s.nextSandboxID, 1))
@@ -214,32 +221,6 @@ func (s *server) createUserSnapshotFromSandbox(sb *sandbox, snapshotID, name str
 	}
 	resumeNeeded = false
 	return meta, nil
-}
-
-func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta) (*sandbox, error) {
-	restoreStart := time.Now()
-	for _, p := range []string{meta.StateFile, meta.MemFile, meta.DiskFile} {
-		if !fileExists(p) {
-			return nil, fmt.Errorf("snapshot artifact missing: %s", p)
-		}
-	}
-	sb, timings, err := s.restoreSandboxFromArtifacts(
-		id,
-		restoreStart,
-		meta.DiskFile,
-		meta.StateFile,
-		meta.MemFile,
-		"clone user snapshot disk",
-		false,
-		false,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if s.cfg.EnableStageTimingLogs {
-		log.Printf("snapshot restore timing: snapshot_id=%s sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", meta.SnapshotID, id, timings.DiskMaterialize, timings.NetnsAcquire, timings.PrepOverlap, timings.SocketReady, timings.SnapshotLoad, timings.AgentReady, timings.GuestNet, timings.Total)
-	}
-	return sb, nil
 }
 
 func (s *server) writeUserSnapshotMeta(meta userSnapshotMeta) error {

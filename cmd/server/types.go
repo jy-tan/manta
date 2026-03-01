@@ -73,6 +73,10 @@ type sandbox struct {
 	SSHClient  *ssh.Client // debug-only; exec path no longer depends on SSH
 	Agent      *agentConn
 	agentMu    sync.Mutex
+
+	lifecycleMu  sync.Mutex
+	state        sandboxState
+	inFlightExec int
 }
 
 type server struct {

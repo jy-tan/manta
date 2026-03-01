@@ -76,25 +76,13 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 	if err := writeVMConfig(configPath, s.cfg, nc.TapName, "rootfs.ext4", nc.Subnet, "vsock.sock", uint32(1000+nc.Subnet)); err != nil {
 		return nil, fmt.Errorf("write vm config: %w", err)
 	}
-	socketPath := filepath.Join(sbDir, "firecracker.sock")
-	_ = os.Remove(socketPath)
-	_ = os.Remove(filepath.Join(sbDir, "vsock.sock"))
-
-	logPath := filepath.Join(sbDir, "firecracker.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	socketPath, vsockPath, logPath := prepareSandboxRuntimePaths(sbDir)
+	logFile, err := openSandboxLog(logPath)
 	if err != nil {
-		return nil, fmt.Errorf("open firecracker log file: %w", err)
+		return nil, err
 	}
 
-	var cgroupPath string
-	if s.cfg.EnableCgroups {
-		cg := filepath.Join(s.cfg.CgroupRoot, id)
-		if err := os.Mkdir(cg, 0o755); err == nil {
-			cgroupPath = cg
-		} else {
-			log.Printf("create cgroup %q failed, continuing without cgroups: %v", cg, err)
-		}
-	}
+	cgroupPath := s.prepareSandboxCgroup(id, true)
 
 	fcCmd := exec.Command("ip", "netns", "exec", nc.NetnsName, s.cfg.FirecrackerBin, "--api-sock", "firecracker.sock", "--config-file", "vm-config.json")
 	fcCmd.Dir = sbDir
@@ -107,15 +95,8 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 		return nil, fmt.Errorf("start firecracker: %w", err)
 	}
 
-	if cgroupPath != "" {
-		if err := movePidToCgroup(cgroupPath, fcCmd.Process.Pid); err != nil {
-			log.Printf("move firecracker pid to cgroup failed (pid=%d cgroup=%q): %v", fcCmd.Process.Pid, cgroupPath, err)
-			_ = os.Remove(cgroupPath)
-			cgroupPath = ""
-		}
-	}
+	cgroupPath = s.attachSandboxProcessToCgroup(cgroupPath, fcCmd.Process.Pid, true)
 
-	vsockPath := filepath.Join(sbDir, "vsock.sock")
 	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
 	if err != nil {
 		_ = killProcessGroup(fcCmd)
@@ -128,22 +109,14 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 
 	// Configure per-sandbox networking inside the guest via vsock so /create
 	// doesn't depend on SSHD or disk mutation of /etc/network/interfaces.
-	if _, err := ac.Call(agentrpc.Request{
-		Type: "net",
-		Net: &agentrpc.NetRequest{
-			Interface: "eth0",
-			Address:   nc.GuestIP + "/30",
-			Gateway:   nc.HostIP,
-			DNS:       "1.1.1.1",
-		},
-	}, 5*time.Second); err != nil {
+	if err := s.configureSandboxGuestNetwork(ac, nc); err != nil {
 		_ = ac.Close()
 		_ = killProcessGroup(fcCmd)
 		_ = killCgroup(cgroupPath)
 		_ = cleanupSandboxNetnsAndRouting(s.cfg, nc)
 		cleanupNet = false
 		_ = logFile.Close()
-		return nil, fmt.Errorf("agent network config failed: %w", err)
+		return nil, err
 	}
 
 	_ = logFile.Close()
@@ -167,8 +140,68 @@ func (s *server) createSandbox(id string) (*sandbox, error) {
 		CgroupPath: cgroupPath,
 		Process:    fcCmd,
 		Agent:      ac,
+		state:      sandboxStateRunning,
 	}
 	return sb, nil
+}
+
+func prepareSandboxRuntimePaths(sbDir string) (socketPath, vsockPath, logPath string) {
+	socketPath = filepath.Join(sbDir, "firecracker.sock")
+	vsockPath = filepath.Join(sbDir, "vsock.sock")
+	logPath = filepath.Join(sbDir, "firecracker.log")
+	_ = os.Remove(socketPath)
+	_ = os.Remove(vsockPath)
+	return socketPath, vsockPath, logPath
+}
+
+func openSandboxLog(logPath string) (*os.File, error) {
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if err != nil {
+		return nil, fmt.Errorf("open firecracker log file: %w", err)
+	}
+	return logFile, nil
+}
+
+func (s *server) prepareSandboxCgroup(id string, logErrors bool) string {
+	if !s.cfg.EnableCgroups {
+		return ""
+	}
+	cg := filepath.Join(s.cfg.CgroupRoot, id)
+	if err := os.Mkdir(cg, 0o755); err == nil {
+		return cg
+	} else if logErrors {
+		log.Printf("create cgroup %q failed, continuing without cgroups: %v", cg, err)
+	}
+	return ""
+}
+
+func (s *server) attachSandboxProcessToCgroup(cgroupPath string, pid int, logErrors bool) string {
+	if cgroupPath == "" {
+		return ""
+	}
+	if err := movePidToCgroup(cgroupPath, pid); err != nil {
+		if logErrors {
+			log.Printf("move firecracker pid to cgroup failed (pid=%d cgroup=%q): %v", pid, cgroupPath, err)
+		}
+		_ = os.Remove(cgroupPath)
+		return ""
+	}
+	return cgroupPath
+}
+
+func (s *server) configureSandboxGuestNetwork(ac *agentConn, nc *netnsConfig) error {
+	if _, err := ac.Call(agentrpc.Request{
+		Type: "net",
+		Net: &agentrpc.NetRequest{
+			Interface: "eth0",
+			Address:   nc.GuestIP + "/30",
+			Gateway:   nc.HostIP,
+			DNS:       "1.1.1.1",
+		},
+	}, 5*time.Second); err != nil {
+		return fmt.Errorf("agent network config failed: %w", err)
+	}
+	return nil
 }
 
 func (s *server) cleanupSandbox(sb *sandbox) error {
@@ -242,8 +275,14 @@ func (s *server) destroyAll() {
 	s.mu.Unlock()
 
 	for _, sb := range all {
+		if sb.beginDestroy() {
+			if !sb.waitForExecDrain(destroyExecDrainTimeout) {
+				log.Printf("destroyAll %s proceeding with %d in-flight exec(s) after %s drain timeout", sb.ID, sb.currentInFlightExec(), destroyExecDrainTimeout)
+			}
+		}
 		if err := s.cleanupSandbox(sb); err != nil {
 			log.Printf("cleanup %s error: %v", sb.ID, err)
 		}
+		sb.finishDestroy()
 	}
 }
