@@ -6,15 +6,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"time"
-
-	"manta/internal/agentrpc"
 )
 
 type snapshotCreateRequest struct {
@@ -227,176 +223,23 @@ func (s *server) createSandboxFromUserSnapshot(id string, meta userSnapshotMeta)
 			return nil, fmt.Errorf("snapshot artifact missing: %s", p)
 		}
 	}
-
-	sbDir := filepath.Join(s.cfg.WorkDir, "sandboxes", id)
-	if err := os.MkdirAll(sbDir, 0o755); err != nil {
-		return nil, fmt.Errorf("create sandbox dir: %w", err)
-	}
-	cleanupDir := true
-	defer func() {
-		if cleanupDir {
-			_ = os.RemoveAll(sbDir)
-		}
-	}()
-
-	rootfsCopy := filepath.Join(sbDir, "rootfs.ext4")
-	cloneCh := make(chan struct {
-		err error
-		dur time.Duration
-	}, 1)
-	netnsCh := make(chan struct {
-		nc  *netnsConfig
-		err error
-		dur time.Duration
-	}, 1)
-	go func() {
-		start := time.Now()
-		if err := materializeSandboxRootfs(s.cfg, meta.DiskFile, rootfsCopy); err != nil {
-			cloneCh <- struct {
-				err error
-				dur time.Duration
-			}{err: fmt.Errorf("clone user snapshot disk: %w", err), dur: time.Since(start)}
-			return
-		}
-		cloneCh <- struct {
-			err error
-			dur time.Duration
-		}{err: nil, dur: time.Since(start)}
-	}()
-	go func() {
-		start := time.Now()
-		nc, err := s.acquireNetns(id)
-		netnsCh <- struct {
-			nc  *netnsConfig
-			err error
-			dur time.Duration
-		}{nc: nc, err: err, dur: time.Since(start)}
-	}()
-
-	cloneRes := <-cloneCh
-	netnsRes := <-netnsCh
-	prepOverlapDur := time.Since(restoreStart)
-	if cloneRes.err != nil || netnsRes.err != nil {
-		if netnsRes.nc != nil {
-			s.releaseNetns(netnsRes.nc)
-		}
-		if cloneRes.err != nil {
-			return nil, cloneRes.err
-		}
-		return nil, netnsRes.err
-	}
-	nc := netnsRes.nc
-	cleanupNet := true
-	defer func() {
-		if cleanupNet {
-			s.releaseNetns(nc)
-		}
-	}()
-
-	socketPath := filepath.Join(sbDir, "firecracker.sock")
-	_ = os.Remove(socketPath)
-	_ = os.Remove(filepath.Join(sbDir, "vsock.sock"))
-
-	logPath := filepath.Join(sbDir, "firecracker.log")
-	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	sb, timings, err := s.restoreSandboxFromArtifacts(
+		id,
+		restoreStart,
+		meta.DiskFile,
+		meta.StateFile,
+		meta.MemFile,
+		"clone user snapshot disk",
+		false,
+		false,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("open firecracker log file: %w", err)
+		return nil, err
 	}
-
-	var cgroupPath string
-	if s.cfg.EnableCgroups {
-		cg := filepath.Join(s.cfg.CgroupRoot, id)
-		if err := os.Mkdir(cg, 0o755); err == nil {
-			cgroupPath = cg
-		}
-	}
-
-	fcCmd := exec.Command("ip", "netns", "exec", nc.NetnsName, s.cfg.FirecrackerBin, "--api-sock", "firecracker.sock")
-	fcCmd.Dir = sbDir
-	fcCmd.Stdout = logFile
-	fcCmd.Stderr = logFile
-	fcCmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if err := fcCmd.Start(); err != nil {
-		_ = logFile.Close()
-		return nil, fmt.Errorf("start firecracker: %w", err)
-	}
-	socketWaitStart := time.Now()
-	if err := waitForUnixSocketReady(socketPath, 1500*time.Millisecond); err != nil {
-		_ = killProcessGroup(fcCmd)
-		_ = killCgroup(cgroupPath)
-		_ = logFile.Close()
-		return nil, fmt.Errorf("firecracker api socket not ready: %w", err)
-	}
-	socketReadyDur := time.Since(socketWaitStart)
-	if cgroupPath != "" {
-		if err := movePidToCgroup(cgroupPath, fcCmd.Process.Pid); err != nil {
-			_ = os.Remove(cgroupPath)
-			cgroupPath = ""
-		}
-	}
-
-	fc := newFCClient(socketPath, 10*time.Second)
-	loadStart := time.Now()
-	if err := loadSnapshotWithRetry(fc, meta.StateFile, meta.MemFile, true, 1500*time.Millisecond); err != nil {
-		_ = killProcessGroup(fcCmd)
-		_ = killCgroup(cgroupPath)
-		_ = logFile.Close()
-		return nil, fmt.Errorf("load snapshot: %w", err)
-	}
-	loadDur := time.Since(loadStart)
-
-	vsockPath := filepath.Join(sbDir, "vsock.sock")
-	agentWaitStart := time.Now()
-	ac, err := waitForAgentReady(vsockPath, s.cfg.AgentPort, s.cfg.AgentWaitTimeout, s.cfg.AgentDialTimeout)
-	if err != nil {
-		_ = killProcessGroup(fcCmd)
-		_ = killCgroup(cgroupPath)
-		_ = logFile.Close()
-		return nil, fmt.Errorf("wait for agent after snapshot: %w", err)
-	}
-	agentReadyDur := time.Since(agentWaitStart)
-	guestNetStart := time.Now()
-	if _, err := ac.Call(agentrpc.Request{
-		Type: "net",
-		Net: &agentrpc.NetRequest{
-			Interface: "eth0",
-			Address:   nc.GuestIP + "/30",
-			Gateway:   nc.HostIP,
-			DNS:       "1.1.1.1",
-		},
-	}, 5*time.Second); err != nil {
-		_ = ac.Close()
-		_ = killProcessGroup(fcCmd)
-		_ = killCgroup(cgroupPath)
-		_ = logFile.Close()
-		return nil, fmt.Errorf("agent network config failed: %w", err)
-	}
-	guestNetDur := time.Since(guestNetStart)
-
-	_ = logFile.Close()
-	cleanupNet = false
-	cleanupDir = false
-	totalDur := time.Since(restoreStart)
 	if s.cfg.EnableStageTimingLogs {
-		log.Printf("snapshot restore timing: snapshot_id=%s sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", meta.SnapshotID, id, cloneRes.dur, netnsRes.dur, prepOverlapDur, socketReadyDur, loadDur, agentReadyDur, guestNetDur, totalDur)
+		log.Printf("snapshot restore timing: snapshot_id=%s sandbox_id=%s disk_materialize=%s netns_acquire=%s prep_overlap=%s socket_ready=%s snapshot_load=%s agent_ready=%s guest_net=%s total=%s", meta.SnapshotID, id, timings.DiskMaterialize, timings.NetnsAcquire, timings.PrepOverlap, timings.SocketReady, timings.SnapshotLoad, timings.AgentReady, timings.GuestNet, timings.Total)
 	}
-	return &sandbox{
-		ID:         id,
-		Subnet:     nc.Subnet,
-		TapDevice:  nc.TapName,
-		HostIP:     nc.HostIP,
-		GuestIP:    nc.GuestIP,
-		GuestCID:   3,
-		Netns:      nc,
-		Dir:        sbDir,
-		SocketPath: socketPath,
-		VsockPath:  vsockPath,
-		RootfsPath: rootfsCopy,
-		LogPath:    logPath,
-		CgroupPath: cgroupPath,
-		Process:    fcCmd,
-		Agent:      ac,
-	}, nil
+	return sb, nil
 }
 
 func (s *server) writeUserSnapshotMeta(meta userSnapshotMeta) error {
