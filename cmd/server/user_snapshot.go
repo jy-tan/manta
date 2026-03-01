@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -47,6 +48,19 @@ type userSnapshotMeta struct {
 	LineageID        string `json:"lineage_id"`
 	SourceSandboxID  string `json:"source_sandbox_id"`
 	SourceRootfsPath string `json:"source_rootfs_path"`
+}
+
+var snapshotIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+
+func normalizeSnapshotID(raw string) (string, error) {
+	id := strings.TrimSpace(raw)
+	if id == "" {
+		return "", fmt.Errorf("snapshot_id is required")
+	}
+	if !snapshotIDPattern.MatchString(id) {
+		return "", fmt.Errorf("invalid snapshot_id")
+	}
+	return id, nil
 }
 
 func userSnapshotsDir(workDir string) string {
@@ -95,13 +109,13 @@ func (s *server) handleSnapshotRestore(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	req.SnapshotID = strings.TrimSpace(req.SnapshotID)
-	if req.SnapshotID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
+	snapshotID, err := normalizeSnapshotID(req.SnapshotID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
-	meta, err := s.loadUserSnapshotMeta(req.SnapshotID)
+	meta, err := s.loadUserSnapshotMeta(snapshotID)
 	if err != nil {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
@@ -147,12 +161,12 @@ func (s *server) handleSnapshotDelete(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
 		return
 	}
-	req.SnapshotID = strings.TrimSpace(req.SnapshotID)
-	if req.SnapshotID == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "snapshot_id is required"})
+	snapshotID, err := normalizeSnapshotID(req.SnapshotID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
-	if err := os.RemoveAll(userSnapshotRootDir(s.cfg.WorkDir, req.SnapshotID)); err != nil {
+	if err := os.RemoveAll(userSnapshotRootDir(s.cfg.WorkDir, snapshotID)); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": fmt.Sprintf("delete snapshot: %v", err)})
 		return
 	}
@@ -241,6 +255,10 @@ func (s *server) writeUserSnapshotMeta(meta userSnapshotMeta) error {
 }
 
 func (s *server) loadUserSnapshotMeta(snapshotID string) (userSnapshotMeta, error) {
+	snapshotID, err := normalizeSnapshotID(snapshotID)
+	if err != nil {
+		return userSnapshotMeta{}, err
+	}
 	metaPath := userSnapshotMetaPath(s.cfg.WorkDir, snapshotID)
 	raw, err := os.ReadFile(metaPath)
 	if err != nil {
